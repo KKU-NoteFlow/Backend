@@ -22,3 +22,7 @@ class KakaoRegisterRequest(BaseModel):
 
 class GoogleLoginRequest(BaseModel):
     token: str
+
+class NaverLoginRequest(BaseModel):
+    code: str
+    state: str

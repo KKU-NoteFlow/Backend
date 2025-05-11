@@ -6,6 +6,7 @@ from schemas.user import *
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 import os
+import requests
 
 router = APIRouter(prefix="/api/v1", tags=["Auth"])
 
@@ -71,3 +72,50 @@ def login_google(request: GoogleLoginRequest, db: Session = Depends(get_db)):
         message="Google Login Success",
         user_id=user.id
     )
+
+@router.post("/login/naver", response_model=LoginResponse)
+def login_naver(request: NaverLoginRequest, db: Session = Depends(get_db)):
+    client_id = os.getenv("NAVER_CLIENT_ID")
+    client_secret = os.getenv("NAVER_CLIENT_SECRET")
+    redirect_uri = "http://localhost:5173/naver/callback"
+
+    # 1. access_token 요청
+    token_url = (
+        f"https://nid.naver.com/oauth2.0/token?grant_type=authorization_code"
+        f"&client_id={client_id}&client_secret={client_secret}"
+        f"&code={request.code}&state={request.state}"
+    )
+    token_res = requests.get(token_url)
+    if token_res.status_code != 200:
+        raise HTTPException(status_code=400, detail="Naver token 요청 실패")
+
+    token_data = token_res.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Naver access_token 없음")
+
+    # 2. 사용자 정보 요청
+    headers = { "Authorization": f"Bearer {access_token}" }
+    profile_res = requests.get("https://openapi.naver.com/v1/nid/me", headers=headers)
+    profile_data = profile_res.json()
+
+    if profile_data.get("resultcode") != "00":
+        raise HTTPException(status_code=400, detail="Naver 사용자 정보 요청 실패")
+
+    naver_id = profile_data["response"]["id"]
+    email = profile_data["response"].get("email", f"{naver_id}@naver.local")
+
+    # 3. 기존 사용자 확인 및 저장
+    user = db.query(User).filter(User.id == naver_id, User.provider == 'naver').first()
+    if not user:
+        user = User(
+            id=naver_id,
+            email=email,
+            password="naver_dummy",
+            provider="naver"
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    return LoginResponse(message="Naver login success", user_id=user.id)

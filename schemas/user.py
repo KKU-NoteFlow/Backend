@@ -19,3 +19,6 @@ class LoginResponse(BaseModel):
 
 class KakaoRegisterRequest(BaseModel):
     access_token: str
+
+class GoogleLoginRequest(BaseModel):
+    token: str

@@ -3,7 +3,7 @@
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware  # ensure this import exists
+from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
 
@@ -18,9 +18,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # 4) CORS 설정
+origins = [
+    "http://localhost:5173",
+    "http://222.116.135.71:5173"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 프론트 도메인 허용
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,7 +45,7 @@ def read_root():
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",    # localhost에서만 접근 허용
+        host="0.0.0.0",
         port=8080,
         reload=True,
         env_file=".env"

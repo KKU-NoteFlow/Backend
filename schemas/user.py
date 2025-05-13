@@ -17,7 +17,7 @@ class LoginResponse(BaseModel):
     message: str
     user_id: str
 
-class KakaoRegisterRequest(BaseModel):
+class KakaoLoginRequest(BaseModel):
     access_token: str
 
 class GoogleLoginRequest(BaseModel):

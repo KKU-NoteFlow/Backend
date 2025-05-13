@@ -1,31 +1,45 @@
-# uvicorn main:app --host 0.0.0.0 --port 8081 --reload
-from fastapi import FastAPI, HTTPException, APIRouter
-from sqlalchemy import create_engine
+import os
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import logging
-# import jwt
-# from jwt import PyJWTError
 import uvicorn
 
-from models import *
-from routers import routers
-from schemas import *
+# 1) 환경변수 로드
+load_dotenv()
 
-# 로깅 설정
+# 2) 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI 애플리케이션 설정
+# 3) FastAPI 앱 생성
 app = FastAPI()
 
-# 라우터 등록
+# 4) CORS 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # 프론트 엔드 어디서든 허용
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 5) 라우터 등록
+from routers import routers
 for router in routers:
     app.include_router(router)
 
-
+# 6) 루트 엔드포인트
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"message": "Hello World"}
 
-# FastAPI 테스트 클라이언트 설정 
+# 7) 실행
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8080,
+        reload=True,
+        env_file=".env"
+    )

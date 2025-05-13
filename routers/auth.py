@@ -6,6 +6,8 @@ from schemas.user import *
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 import os
+KAKAO_CLIENT_ID = os.getenv("KAKAO_CLIENT_ID")
+REDIRECT_URI = os.getenv("KAKAO_REDIRECT_URI")
 import requests
 
 router = APIRouter(prefix="/api/v1", tags=["Auth"])
@@ -119,3 +121,55 @@ def login_naver(request: NaverLoginRequest, db: Session = Depends(get_db)):
         db.refresh(user)
 
     return LoginResponse(message="Naver login success", user_id=user.id)
+
+@router.get("/auth/kakao/callback", response_model=LoginResponse)
+def kakao_callback(code: str, db: Session = Depends(get_db)):
+    # 1. access token 요청
+    token_url = "https://kauth.kakao.com/oauth/token"
+    token_data = {
+        "grant_type": "authorization_code",
+        "client_id": KAKAO_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
+    }
+
+    token_headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    token_response = requests.post(token_url, data=token_data, headers=token_headers)
+    if token_response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to get Kakao token")
+
+    access_token = token_response.json().get("access_token")
+
+    # 2. 사용자 정보 요청
+    user_info_response = requests.get(
+        "https://kapi.kakao.com/v2/user/me",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    if user_info_response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to get user info")
+
+    kakao_info = user_info_response.json()
+    kakao_id = str(kakao_info.get("id"))
+    kakao_account = kakao_info.get("kakao_account", {})
+    email = kakao_account.get("email", f"{kakao_id}@kakao.com")
+
+    # 3. DB 사용자 등록 또는 조회
+    user = db.query(User).filter(User.id == kakao_id, User.provider == "kakao").first()
+    if not user:
+        user = User(
+            id=kakao_id,
+            email=email,
+            password="kakao_dummy",
+            provider="kakao"
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    return LoginResponse(
+        message="Kakao Login Success",
+        user_id=user.id
+    )

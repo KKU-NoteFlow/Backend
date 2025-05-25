@@ -1,3 +1,7 @@
+# schemas/__init__.py
+
 from .user import (
-    RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, KakaoLoginRequest, GoogleLoginRequest, NaverLoginRequest
+    RegisterRequest, RegisterResponse,
+    LoginRequest,    LoginResponse,
+    GoogleLoginRequest, NaverLoginRequest
 )

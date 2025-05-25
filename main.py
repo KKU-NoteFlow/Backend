@@ -1,10 +1,14 @@
 # src/main.py
-]import os
+import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from routers.auth import router as auth_router
+from routers.note import router as note_router
+from routers.folder import router as folder_router 
 import logging
 import uvicorn
+
 
 # 1) 환경변수 로드
 load_dotenv()
@@ -18,8 +22,7 @@ app = FastAPI()
 
 # 4) CORS 설정
 origins = [
-    "http://localhost:5173",
-    "http://222.116.135.71:5173"
+    "http://localhost:5174",
 ]
 
 app.add_middleware(
@@ -31,14 +34,15 @@ app.add_middleware(
 )
 
 # 5) 라우터 등록
-from routers import routers
-for router in routers:
-    app.include_router(router)
+app.include_router(auth_router)
+app.include_router(note_router)
+app.include_router(folder_router)  
+
 
 # 6) 루트 엔드포인트
 @app.get("/")
 def read_root():
-    return {"message": "Hello World"}
+    return {"message": "mini"}
 
 # 7) 실행 설정
 if __name__ == "__main__":

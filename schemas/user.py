@@ -1,3 +1,5 @@
+# schemas/user.py
+
 from pydantic import BaseModel
 
 class RegisterRequest(BaseModel):
@@ -7,7 +9,7 @@ class RegisterRequest(BaseModel):
 
 class RegisterResponse(BaseModel):
     message: str
-    user_id: str
+    user_id: int               # int 타입으로 변경
 
 class LoginRequest(BaseModel):
     loginId: str
@@ -15,7 +17,8 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     message: str
-    user_id: str
+    user_id: int               # int 타입으로 변경
+    access_token: str
 
 class KakaoLoginRequest(BaseModel):
     access_token: str

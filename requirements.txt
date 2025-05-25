@@ -4,3 +4,7 @@ pydantic
 sqlalchemy
 mysql-connector-python
 dotenv
+google-auth
+requests
+python-jose[cryptography]
+bcrypt

@@ -13,7 +13,7 @@ class RegisterResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     loginId: str
-    password: str
+    password: str 
 
 class LoginResponse(BaseModel):
     message: str
@@ -21,7 +21,7 @@ class LoginResponse(BaseModel):
     access_token: str
 
 class KakaoLoginRequest(BaseModel):
-    access_token: str
+    code: str
 
 class GoogleLoginRequest(BaseModel):
     token: str

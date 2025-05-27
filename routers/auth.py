@@ -1,6 +1,6 @@
 # routers/auth.py
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.orm import Session
 import os, requests
 from db import get_db
@@ -8,12 +8,15 @@ from models.user import User
 from schemas.user import (
     RegisterRequest, RegisterResponse,
     LoginRequest,    LoginResponse,
-    GoogleLoginRequest, NaverLoginRequest
+    GoogleLoginRequest, NaverLoginRequest, KakaoLoginRequest
 )
 from utils.password import hash_password, verify_password
 from utils.jwt_utils import create_access_token
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
+import logging
+from dotenv import load_dotenv
+load_dotenv()
 
 KAKAO_CLIENT_ID    = os.getenv("KAKAO_CLIENT_ID")
 KAKAO_REDIRECT_URI = os.getenv("KAKAO_REDIRECT_URI")
@@ -151,24 +154,31 @@ def login_naver(req: NaverLoginRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/auth/kakao/callback", response_model=LoginResponse)
-def kakao_callback(code: str, db: Session = Depends(get_db)):
-    # 1) 액세스 토큰 요청
-    token_res = requests.post(
-        "https://kauth.kakao.com/oauth/token",
-        data={
-            "grant_type": "authorization_code",
-            "client_id": KAKAO_CLIENT_ID,
-            "redirect_uri": KAKAO_REDIRECT_URI,
-            "code": code
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
-    )
+
+# 카카오 콜백 라우터
+@router.post("/auth/kakao/callback", response_model=LoginResponse)
+def kakao_callback(code: str = Form(...), db: Session = Depends(get_db)):
+    logging.warning(f"받은 code: {code}")
+
+    token_url = "https://kauth.kakao.com/oauth/token"
+    token_data = {
+        "grant_type": "authorization_code",
+        "client_id": KAKAO_CLIENT_ID,
+        "redirect_uri": KAKAO_REDIRECT_URI,
+        "code": code,
+    }
+    token_headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    token_res = requests.post(token_url, data=token_data, headers=token_headers)
     if token_res.status_code != 200:
         raise HTTPException(status_code=400, detail="Kakao token 요청 실패")
 
     access_token = token_res.json().get("access_token")
-    # 2) 프로필 요청
+    if not access_token:
+        raise HTTPException(status_code=400, detail="액세스 토큰 없음")
+
     profile_res = requests.get(
         "https://kapi.kakao.com/v2/user/me",
         headers={"Authorization": f"Bearer {access_token}"}
@@ -177,21 +187,13 @@ def kakao_callback(code: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Kakao 사용자 정보 요청 실패")
 
     kakao_info = profile_res.json()
-    kakao_id   = str(kakao_info.get("id"))
-    email      = kakao_info.get("kakao_account", {}).get("email", f"{kakao_id}@kakao.com")
+    kakao_id = str(kakao_info.get("id"))
+    kakao_account = kakao_info.get("kakao_account", {})
+    email = kakao_account.get("email", f"{kakao_id}@kakao.com")
 
-    # 3) DB 조회 또는 생성
-    user = db.query(User).filter(
-        User.id == kakao_id,
-        User.provider == "kakao"
-    ).first()
+    user = db.query(User).filter(User.id == kakao_id, User.provider == "kakao").first()
     if not user:
-        user = User(
-            id=kakao_id,
-            email=email,
-            password="kakao_dummy",
-            provider="kakao"
-        )
+        user = User(id=kakao_id, email=email, password="kakao_dummy", provider="kakao")
         db.add(user)
         db.commit()
         db.refresh(user)

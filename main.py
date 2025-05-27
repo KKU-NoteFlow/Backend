@@ -7,7 +7,7 @@ from routers.auth import router as auth_router
 from routers.note import router as note_router
 from routers.folder import router as folder_router 
 import logging
-import uvicorn
+
 
 
 # 1) 환경변수 로드
@@ -27,7 +27,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # 프론트 주소 (또는 "*"로 전체 허용 가능)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

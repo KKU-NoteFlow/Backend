@@ -21,7 +21,7 @@ class LoginResponse(BaseModel):
     access_token: str
 
 class KakaoLoginRequest(BaseModel):
-    access_token: str
+    code: str
 
 class GoogleLoginRequest(BaseModel):
     token: str

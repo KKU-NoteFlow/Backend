@@ -3,5 +3,6 @@
 from .user import (
     RegisterRequest, RegisterResponse,
     LoginRequest,    LoginResponse,
-    GoogleLoginRequest, NaverLoginRequest
+    GoogleLoginRequest, NaverLoginRequest,
+    KakaoLoginRequest,
 )

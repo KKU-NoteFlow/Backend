@@ -155,7 +155,7 @@ def login_naver(req: NaverLoginRequest, db: Session = Depends(get_db)):
 
 
 
-# 카카오 콜백 라우터
+# 카카오 콜백 라우터 
 @router.post("/auth/kakao/callback", response_model=LoginResponse)
 def kakao_callback(code: str = Form(...), db: Session = Depends(get_db)):
     logging.warning(f"받은 code: {code}")

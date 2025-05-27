@@ -13,7 +13,7 @@ class RegisterResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     loginId: str
-    password: str
+    password: str 
 
 class LoginResponse(BaseModel):
     message: str

@@ -7,6 +7,9 @@ class NoteCreate(BaseModel):
     content: Optional[str] = None
     folder_id: Optional[int] = None
 
+class FavoriteUpdate(BaseModel):
+    is_favorite: bool
+
 class NoteResponse(BaseModel):
     id: int
     user_id: int

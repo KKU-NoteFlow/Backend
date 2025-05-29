@@ -10,6 +10,20 @@ from utils.jwt_utils import get_current_user
 
 router = APIRouter(prefix="/api/v1", tags=["Folders"])
 
+#폴더의 하위 폴더 들을 전부 삭제하기 위한 함수(노트 포함)
+def get_all_descendant_folder_ids(db: Session, parent_id: int, user_id: int):
+    result = []
+    stack = [parent_id]
+
+    while stack:
+        current = stack.pop()
+        result.append(current)
+        children = db.query(Folder.id).filter(Folder.parent_id == current, Folder.user_id == user_id).all()
+        stack.extend([child.id for child in children])
+
+    return result
+
+
 @router.get("/folders", response_model=List[FolderResponse])
 def list_folders(
     db: Session = Depends(get_db),
@@ -79,18 +93,25 @@ def update_folder(
     setattr(folder, 'notes', [])
     return folder
 
-@router.delete("/folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/folders/{folder_id}")
 def delete_folder(
     folder_id: int,
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
-    folder = db.query(Folder).filter(
-        Folder.id == folder_id,
-        Folder.user_id == user.u_id
-    ).first()
+    folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == user.u_id).first()
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
-    db.delete(folder)
+
+    # 🔁 모든 하위 폴더 ID까지 재귀 수집
+    all_folder_ids = get_all_descendant_folder_ids(db, folder_id, user.u_id)
+
+    # 📝 해당 폴더들에 있는 모든 노트 삭제
+    db.query(Note).filter(Note.folder_id.in_(all_folder_ids)).delete(synchronize_session=False)
+
+    # 📁 모든 하위 폴더 삭제
+    db.query(Folder).filter(Folder.id.in_(all_folder_ids)).delete(synchronize_session=False)
+
     db.commit()
-    return
+    return {"message": f"Deleted folder and its {len(all_folder_ids)-1} subfolders."}
+

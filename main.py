@@ -6,7 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from routers.auth import router as auth_router
 from routers.note import router as note_router
 from routers.folder import router as folder_router 
+from fastapi.staticfiles import StaticFiles
+from routers.file import router as file_router 
 import logging
+
 
 
 
@@ -37,7 +40,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(note_router)
 app.include_router(folder_router)  
-
+app.include_router(file_router)
 
 # 6) 루트 엔드포인트
 @app.get("/")

@@ -18,3 +18,4 @@ transformers>=4.40.0
 accelerate
 sentencepiece
 protobuf
+python-multipart

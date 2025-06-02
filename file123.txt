@@ -12,21 +12,20 @@ from sqlalchemy.orm import Session
 
 from db import get_db
 from models.file import File as FileModel
-from models.note import Note as NoteModel      # Note 모델 임포트
 from utils.jwt_utils import get_current_user
 from models.user import User
 
 # -------------------------------
 # 1) PIL(Image) 및 OCR 라이브러리 임포트
 # -------------------------------
-from PIL import Image                      # PIL.Image 임포트
+from PIL import Image                      # 수정: PIL.Image 임포트 추가
 from easyocr import Reader                 # EasyOCR Reader 임포트
 
 # Korean, English 지원, GPU 사용
 reader = Reader(["ko", "en"], gpu=True)    # EasyOCR Reader 초기화
 
 # -------------------------------
-# 2) Summarization 모델 로드 (기존 코드 유지하되 주석 처리)
+# 2) Summarization 모델 로드 (기존과 동일)
 # -------------------------------
 from transformers import pipeline
 
@@ -169,20 +168,19 @@ def download_file(
 
 @router.post(
     "/ocr",
-    summary="이미지 OCR → 텍스트 변환 후 노트 생성",
+    summary="이미지 OCR → 텍스트 변환 및 요약",
     response_model=dict
 )
-async def ocr_and_create_note(
+async def ocr_and_summarize(
     ocr_file: UploadFile = File(...),
-    folder_id: Optional[int] = Form(None),          # 노트를 저장할 폴더 ID (선택)
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     • ocr_file: 이미지 파일(UploadFile)
     • 1) EasyOCR 모델로 텍스트 인식 (한글·영어 지원, GPU 사용)
-    • 2) 인식된 텍스트를 새로운 Note 모델로 저장
-    • 결과: {"note_id": 새로 생성된 노트 ID, "text": "인식된 텍스트"} 반환
+    • 2) 인식된 텍스트를 Summarization 모델로 전달하여 요약
+    • 결과: {"text": "원본 OCR 텍스트", "summary": "요약된 텍스트"} 형태로 반환
     """
     # ----------
     # 1) 이미지 처리 → OCR 텍스트 추출
@@ -193,12 +191,14 @@ async def ocr_and_create_note(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"이미지 처리 실패: {e}")
 
+    # EasyOCR로 텍스트 추출
     try:
         # PIL 이미지를 numpy 배열로 변환
         image_np = np.array(image)
-        # EasyOCR로 텍스트 추출
+        # reader.readtext 결과: [([bbox], "텍스트", 신뢰도), ...]
         results = reader.readtext(image_np)
         if not results:
+            # 인식된 텍스트가 없을 경우
             raise ValueError("텍스트를 인식할 수 없습니다.")
         # 인식된 텍스트들 결합
         ocr_text = " ".join([res[1] for res in results])
@@ -206,37 +206,21 @@ async def ocr_and_create_note(
         raise HTTPException(status_code=500, detail=f"OCR 수행 실패: {e}")
 
     # ----------
-    # 2) Summarization 부분 주석 처리
-    # ----------
-    # try:
-    #     summary_list = summarizer(
-    #         ocr_text,
-    #         max_length=120,
-    #         min_length=30,
-    #         do_sample=False
-    #     )
-    #     summarized_text = summary_list[0]["summary_text"]
-    # except Exception as e:
-    #     summarized_text = ""
-    #     print(f"[OCR & Summarization] 요약 중 오류 발생: {e}")
-
-    # ----------
-    # 3) 새 노트 생성 및 DB에 저장 (이미지 텍스트 결과 저장)
+    # 2) Summarization 모델로 요약 수행
     # ----------
     try:
-        new_note = NoteModel(
-            user_id=current_user.u_id,
-            folder_id=folder_id,
-            title="OCR 결과",           # 고정 제목. 필요 시 변경 가능
-            content=ocr_text
+        summary_list = summarizer(
+            ocr_text,
+            max_length=120,
+            min_length=30,
+            do_sample=False
         )
-        db.add(new_note)
-        db.commit()
-        db.refresh(new_note)
+        summarized_text = summary_list[0]["summary_text"]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"노트 저장 실패: {e}")
+        summarized_text = ""
+        print(f"[OCR & Summarization] 요약 중 오류 발생: {e}")
 
     return {
-        "note_id": new_note.id,
-        "text": ocr_text
+        "text": ocr_text,
+        "summary": summarized_text
     }

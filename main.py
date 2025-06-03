@@ -9,9 +9,7 @@ from routers.folder import router as folder_router
 from fastapi.staticfiles import StaticFiles
 from routers.file import router as file_router 
 import logging
-
-
-
+import uvicorn  
 
 # 1) 환경변수 로드
 load_dotenv()
@@ -30,7 +28,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 프론트 주소 (또는 "*"로 전체 허용 가능)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

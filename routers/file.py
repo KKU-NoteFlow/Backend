@@ -1,40 +1,56 @@
-# backend/routers/file.py
+# ~/noteflow/Backend/routers/file.py
 
 import os
-import urllib.parse
 import io
-import numpy as np                        # numpy 임포트 (이미지를 배열로 변환하기 위함)
-from typing import List, Optional
+import numpy as np
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from PIL import Image
 
 from db import get_db
 from models.file import File as FileModel
-from models.note import Note as NoteModel      # Note 모델 임포트
+from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
-from models.user import User
 
 # -------------------------------
-# 1) PIL(Image) 및 OCR 라이브러리 임포트
+# 1) EasyOCR 라이브러리 임포트 (GPU 모드 활성화)
 # -------------------------------
-from PIL import Image                      # PIL.Image 임포트
-from easyocr import Reader                 # EasyOCR Reader 임포트
-
-# Korean, English 지원, GPU 사용
-reader = Reader(["ko", "en"], gpu=True)    # EasyOCR Reader 초기화
+import easyocr
+# GPU가 있는 환경에서는 gpu=True로 설정합니다.
+reader = easyocr.Reader(["ko", "en"], gpu=True)
 
 # -------------------------------
-# 2) Summarization 모델 로드 (기존 코드 유지하되 주석 처리)
+# 2) Hugging Face TrOCR 모델용 파이프라인 (GPU 사용)
 # -------------------------------
 from transformers import pipeline
 
-summarizer = pipeline(
-    "summarization",
-    model="facebook/bart-large-cnn",
-    tokenizer="facebook/bart-large-cnn",
-    device=-1  # CPU 사용. GPU 사용 시 0 또는 적절한 번호로 변경
+# device=0 으로 지정 → 첫 번째 GPU 사용
+hf_trocr_printed = pipeline(
+    "image-to-text",
+    model="microsoft/trocr-base-printed",
+    device=0,
+    trust_remote_code=True
+)
+hf_trocr_handwritten = pipeline(
+    "image-to-text",
+    model="microsoft/trocr-base-handwritten",
+    device=0,
+    trust_remote_code=True
+)
+hf_trocr_small_printed = pipeline(
+    "image-to-text",
+    model="microsoft/trocr-small-printed",
+    device=0,
+    trust_remote_code=True
+)
+hf_trocr_large_printed = pipeline(
+    "image-to-text",
+    model="microsoft/trocr-large-printed",
+    device=0,
+    trust_remote_code=True
 )
 
 # 업로드 디렉토리 설정
@@ -57,7 +73,7 @@ async def upload_file(
     folder_id: Optional[int] = Form(None),
     upload_file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user = Depends(get_current_user)
 ):
     orig_filename: str = upload_file.filename or "unnamed"
     content_type: str = upload_file.content_type or "application/octet-stream"
@@ -100,7 +116,6 @@ async def upload_file(
     db.add(new_file)
     db.commit()
     db.refresh(new_file)
-
     return {
         "file_id": new_file.id,
         "original_name": new_file.original_name,
@@ -118,7 +133,7 @@ async def upload_file(
 def list_files_in_folder(
     folder_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user = Depends(get_current_user)
 ):
     files = (
         db.query(FileModel)
@@ -129,7 +144,6 @@ def list_files_in_folder(
         .order_by(FileModel.created_at.desc())
         .all()
     )
-
     return [
         {
             "file_id": f.id,
@@ -152,18 +166,15 @@ def download_file(
     file_obj = db.query(FileModel).filter(FileModel.id == file_id).first()
     if not file_obj:
         raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
-
     file_path = file_obj.saved_path
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="서버에 파일이 존재하지 않습니다.")
 
-    filename_star = urllib.parse.quote(file_obj.original_name, safe='')
-    content_disposition = f"inline; filename*=UTF-8''{filename_star}"
-
+    filename_star = file_obj.original_name
     return FileResponse(
         path=file_path,
         media_type=file_obj.content_type,
-        headers={"Content-Disposition": content_disposition}
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{filename_star}"}
     )
 
 
@@ -174,61 +185,69 @@ def download_file(
 )
 async def ocr_and_create_note(
     ocr_file: UploadFile = File(...),
-    folder_id: Optional[int] = Form(None),          # 노트를 저장할 폴더 ID (선택)
+    folder_id: Optional[int] = Form(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user = Depends(get_current_user)
 ):
     """
     • ocr_file: 이미지 파일(UploadFile)
-    • 1) EasyOCR 모델로 텍스트 인식 (한글·영어 지원, GPU 사용)
-    • 2) 인식된 텍스트를 새로운 Note 모델로 저장
-    • 결과: {"note_id": 새로 생성된 노트 ID, "text": "인식된 텍스트"} 반환
+    • 1) EasyOCR로 기본 텍스트 추출 (GPU 모드)
+    • 2) TrOCR 4개 모델로 OCR 수행 (모두 GPU)
+    • 3) 가장 긴 결과를 최종 OCR 결과로 선택
+    • 4) Note로 저장 및 결과 반환
     """
-    # ----------
-    # 1) 이미지 처리 → OCR 텍스트 추출
-    # ----------
+
+    # 1) 이미지 로드 (PIL)
     contents = await ocr_file.read()
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"이미지 처리 실패: {e}")
 
+    # 2) EasyOCR로 텍스트 추출
     try:
-        # PIL 이미지를 numpy 배열로 변환
         image_np = np.array(image)
-        # EasyOCR로 텍스트 추출
-        results = reader.readtext(image_np)
-        if not results:
-            raise ValueError("텍스트를 인식할 수 없습니다.")
-        # 인식된 텍스트들 결합
-        ocr_text = " ".join([res[1] for res in results])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR 수행 실패: {e}")
+        easy_results = reader.readtext(image_np)  # GPU 모드 사용
+        easy_text = " ".join([res[1] for res in easy_results])
+    except Exception:
+        easy_text = ""
 
-    # ----------
-    # 2) Summarization 부분 주석 처리
-    # ----------
-    # try:
-    #     summary_list = summarizer(
-    #         ocr_text,
-    #         max_length=120,
-    #         min_length=30,
-    #         do_sample=False
-    #     )
-    #     summarized_text = summary_list[0]["summary_text"]
-    # except Exception as e:
-    #     summarized_text = ""
-    #     print(f"[OCR & Summarization] 요약 중 오류 발생: {e}")
+    # 3) TrOCR 모델 4개로 OCR 수행 (모두 GPU input)
+    hf_texts: List[str] = []
+    try:
+        out1 = hf_trocr_printed(image)
+        if isinstance(out1, list) and "generated_text" in out1[0]:
+            hf_texts.append(out1[0]["generated_text"].strip())
 
-    # ----------
-    # 3) 새 노트 생성 및 DB에 저장 (이미지 텍스트 결과 저장)
-    # ----------
+        out2 = hf_trocr_handwritten(image)
+        if isinstance(out2, list) and "generated_text" in out2[0]:
+            hf_texts.append(out2[0]["generated_text"].strip())
+
+        out3 = hf_trocr_small_printed(image)
+        if isinstance(out3, list) and "generated_text" in out3[0]:
+            hf_texts.append(out3[0]["generated_text"].strip())
+
+        out4 = hf_trocr_large_printed(image)
+        if isinstance(out4, list) and "generated_text" in out4[0]:
+            hf_texts.append(out4[0]["generated_text"].strip())
+    except Exception:
+        # TrOCR 중 오류 발생 시 무시하고 계속 진행
+        pass
+
+    # 4) 여러 OCR 결과 병합: 가장 긴 문자열을 최종 ocr_text로 선택
+    candidates = [t for t in [easy_text] + hf_texts if t and t.strip()]
+    if not candidates:
+        raise HTTPException(status_code=500, detail="텍스트를 인식할 수 없습니다.")
+
+    ocr_text = max(candidates, key=lambda s: len(s))
+
+    # 5) 새 노트 생성 및 DB에 저장
     try:
         new_note = NoteModel(
             user_id=current_user.u_id,
             folder_id=folder_id,
-            title="OCR 결과",           # 고정 제목. 필요 시 변경 가능
-            content=ocr_text
+            title="OCR 결과",
+            content=ocr_text  # **원본 OCR 텍스트만 저장**
         )
         db.add(new_note)
         db.commit()

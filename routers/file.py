@@ -116,8 +116,13 @@ async def upload_file(
     db.add(new_file)
     db.commit()
     db.refresh(new_file)
+
+    base_url = os.getenv("BASE_API_URL", "http://localhost:8000")
+    download_url = f"{base_url}/api/v1/files/download/{new_file.id}"
+
     return {
         "file_id": new_file.id,
+        "url": download_url,
         "original_name": new_file.original_name,
         "folder_id": new_file.folder_id,
         "content_type": new_file.content_type,

@@ -1,4 +1,3 @@
-# ~/noteflow/Backend/routers/file.py
 import os
 import io
 import whisper
@@ -17,6 +16,9 @@ from db import get_db
 from models.file import File as FileModel
 from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
+
+# 추가: 파일명 인코딩용
+import urllib.parse
 
 # -------------------------------
 # 1) EasyOCR 라이브러리 임포트 (GPU 모드 활성화)
@@ -54,7 +56,6 @@ hf_trocr_large_printed = pipeline(
     trust_remote_code=True
 )
 
-# 업로드 디렉토리 설정
 BASE_UPLOAD_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
@@ -79,11 +80,9 @@ async def upload_file(
     orig_filename: str = upload_file.filename or "unnamed"
     content_type: str = upload_file.content_type or "application/octet-stream"
 
-    # 사용자별 디렉토리 생성
     user_dir = os.path.join(BASE_UPLOAD_DIR, str(current_user.u_id))
     os.makedirs(user_dir, exist_ok=True)
 
-    # 원본 파일명 그대로 저장 (동명이인 방지)
     saved_filename = orig_filename
     saved_path = os.path.join(user_dir, saved_filename)
     if os.path.exists(saved_path):
@@ -98,7 +97,6 @@ async def upload_file(
                 break
             counter += 1
 
-    # 파일 저장
     try:
         with open(saved_path, "wb") as buffer:
             content = await upload_file.read()
@@ -106,7 +104,6 @@ async def upload_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"파일 저장 실패: {e}")
 
-    # DB에 메타데이터 기록
     new_file = FileModel(
         user_id=current_user.u_id,
         folder_id=folder_id,
@@ -176,6 +173,9 @@ def download_file(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="서버에 파일이 존재하지 않습니다.")
 
+    # 원본 파일명 UTF-8 URL 인코딩 처리
+    quoted_name = urllib.parse.quote(file_obj.original_name, safe='')
+    content_disposition = f"inline; filename*=UTF-8''{quoted_name}"  
     # original_name 을 percent-encoding 해서 ASCII 만으로 헤더 구성
     filename_quoted = quote(file_obj.original_name)
     content_disposition = f"inline; filename*=UTF-8''{filename_quoted}"

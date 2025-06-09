@@ -20,3 +20,4 @@ sentencepiece
 protobuf
 python-multipart
 easyocr
+whisper

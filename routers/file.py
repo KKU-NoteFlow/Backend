@@ -2,6 +2,9 @@
 
 import os
 import io
+import whisper
+model = whisper.load_model("base")
+from datetime import datetime
 import numpy as np
 from typing import Optional, List
 
@@ -263,4 +266,65 @@ async def ocr_and_create_note(
     return {
         "note_id": new_note.id,
         "text": ocr_text
+    }
+
+
+@router.post("/audio")
+async def upload_audio_file(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    # 파일명 및 저장 경로
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"user{user.u_id}_{timestamp}_{file.filename}"
+    save_dir = os.path.join(BASE_UPLOAD_DIR, str(user.u_id), "audio")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, filename)
+
+    # 저장
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+
+    # DB 기록
+    new_file = FileModel(
+        user_id=user.u_id,
+        folder_id=None,
+        original_name=filename,
+        saved_path=save_path,
+        content_type="audio"
+    )
+    db.add(new_file)
+    db.commit()
+    db.refresh(new_file)
+
+    # Whisper로 STT 수행
+    try:
+        result = model.transcribe(save_path, language="ko")  # 언어 설정
+        transcript = result.get("text", "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT 실패: {e}")
+
+    if not transcript:
+        raise HTTPException(status_code=500, detail="음성에서 텍스트를 추출할 수 없습니다.")
+
+    # 노트로 저장
+    try:
+        new_note = NoteModel(
+            user_id=user.u_id,
+            folder_id=None,  # 선택적으로 연결
+            title=f"[음성 노트] {timestamp}",
+            content=transcript
+        )
+        db.add(new_note)
+        db.commit()
+        db.refresh(new_note)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"노트 저장 실패: {e}")
+
+    return {
+        "message": "✅ 음성 업로드 및 노트 생성 성공",
+        "file_id": new_file.id,
+        "note_id": new_note.id,
+        "transcript": transcript
     }

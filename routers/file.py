@@ -1,5 +1,4 @@
-# ~/noteflow/Backend/routers/file.py
-
+# routers/file.py
 import os
 import io
 import whisper
@@ -7,7 +6,6 @@ model = whisper.load_model("base")
 from datetime import datetime
 import numpy as np
 from typing import Optional, List
-from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
 from fastapi.responses import FileResponse
@@ -18,6 +16,9 @@ from db import get_db
 from models.file import File as FileModel
 from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
+
+# 추가: 파일명 인코딩용
+import urllib.parse
 
 # -------------------------------
 # 1) EasyOCR 라이브러리 임포트 (GPU 모드 활성화)
@@ -55,7 +56,6 @@ hf_trocr_large_printed = pipeline(
     trust_remote_code=True
 )
 
-# 업로드 디렉토리 설정
 BASE_UPLOAD_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
@@ -80,11 +80,9 @@ async def upload_file(
     orig_filename: str = upload_file.filename or "unnamed"
     content_type: str = upload_file.content_type or "application/octet-stream"
 
-    # 사용자별 디렉토리 생성
     user_dir = os.path.join(BASE_UPLOAD_DIR, str(current_user.u_id))
     os.makedirs(user_dir, exist_ok=True)
 
-    # 원본 파일명 그대로 저장 (동명이인 방지)
     saved_filename = orig_filename
     saved_path = os.path.join(user_dir, saved_filename)
     if os.path.exists(saved_path):
@@ -99,7 +97,6 @@ async def upload_file(
                 break
             counter += 1
 
-    # 파일 저장
     try:
         with open(saved_path, "wb") as buffer:
             content = await upload_file.read()
@@ -107,7 +104,6 @@ async def upload_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"파일 저장 실패: {e}")
 
-    # DB에 메타데이터 기록
     new_file = FileModel(
         user_id=current_user.u_id,
         folder_id=folder_id,
@@ -177,9 +173,9 @@ def download_file(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="서버에 파일이 존재하지 않습니다.")
 
-    # original_name 을 percent-encoding 해서 ASCII 만으로 헤더 구성
-    filename_quoted = quote(file_obj.original_name)
-    content_disposition = f"inline; filename*=UTF-8''{filename_quoted}"
+    # 원본 파일명 UTF-8 URL 인코딩 처리
+    quoted_name = urllib.parse.quote(file_obj.original_name, safe='')
+    content_disposition = f"inline; filename*=UTF-8''{quoted_name}"  
 
     return FileResponse(
         path=file_path,
@@ -200,52 +196,64 @@ async def ocr_and_create_note(
     current_user = Depends(get_current_user)
 ):
     """
-    • EasyOCR + TrOCR 모델로 이미지에서 텍스트 추출
-    • 가장 긴 결과를 선택해 새 노트로 저장
+    • ocr_file: 이미지 파일(UploadFile)
+    • 1) EasyOCR로 기본 텍스트 추출 (GPU 모드)
+    • 2) TrOCR 4개 모델로 OCR 수행 (모두 GPU)
+    • 3) 가장 긴 결과를 최종 OCR 결과로 선택
+    • 4) Note로 저장 및 결과 반환
     """
-    # 1) 이미지 로드
+
+    # 1) 이미지 로드 (PIL)
     contents = await ocr_file.read()
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"이미지 처리 실패: {e}")
 
-    # 2) EasyOCR
+    # 2) EasyOCR로 텍스트 추출
     try:
         image_np = np.array(image)
-        easy_results = reader.readtext(image_np)
+        easy_results = reader.readtext(image_np)  # GPU 모드 사용
         easy_text = " ".join([res[1] for res in easy_results])
     except Exception:
         easy_text = ""
 
-    # 3) TrOCR 4개 모델
+    # 3) TrOCR 모델 4개로 OCR 수행 (모두 GPU input)
     hf_texts: List[str] = []
     try:
-        for pipe in (
-            hf_trocr_printed,
-            hf_trocr_handwritten,
-            hf_trocr_small_printed,
-            hf_trocr_large_printed
-        ):
-            out = pipe(image)
-            if isinstance(out, list) and "generated_text" in out[0]:
-                hf_texts.append(out[0]["generated_text"].strip())
+        out1 = hf_trocr_printed(image)
+        if isinstance(out1, list) and "generated_text" in out1[0]:
+            hf_texts.append(out1[0]["generated_text"].strip())
+
+        out2 = hf_trocr_handwritten(image)
+        if isinstance(out2, list) and "generated_text" in out2[0]:
+            hf_texts.append(out2[0]["generated_text"].strip())
+
+        out3 = hf_trocr_small_printed(image)
+        if isinstance(out3, list) and "generated_text" in out3[0]:
+            hf_texts.append(out3[0]["generated_text"].strip())
+
+        out4 = hf_trocr_large_printed(image)
+        if isinstance(out4, list) and "generated_text" in out4[0]:
+            hf_texts.append(out4[0]["generated_text"].strip())
     except Exception:
+        # TrOCR 중 오류 발생 시 무시하고 계속 진행
         pass
 
-    # 4) 가장 긴 결과 선택
+    # 4) 여러 OCR 결과 병합: 가장 긴 문자열을 최종 ocr_text로 선택
     candidates = [t for t in [easy_text] + hf_texts if t and t.strip()]
     if not candidates:
         raise HTTPException(status_code=500, detail="텍스트를 인식할 수 없습니다.")
-    ocr_text = max(candidates, key=len)
 
-    # 5) Note 생성
+    ocr_text = max(candidates, key=lambda s: len(s))
+
+    # 5) 새 노트 생성 및 DB에 저장
     try:
         new_note = NoteModel(
             user_id=current_user.u_id,
             folder_id=folder_id,
             title="OCR 결과",
-            content=ocr_text
+            content=ocr_text  # **원본 OCR 텍스트만 저장**
         )
         db.add(new_note)
         db.commit()

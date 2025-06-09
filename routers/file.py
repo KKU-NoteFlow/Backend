@@ -260,26 +260,31 @@ async def ocr_and_create_note(
 
 
 @router.post("/audio")
-async def upload_audio_file(
+async def upload_audio_and_transcribe(
     file: UploadFile = File(...),
+    note_id: Optional[int] = Form(None),
+    folder_id: Optional[int] = Form(None),
     db: Session = Depends(get_db),
-    user = Depends(get_current_user)
+    user=Depends(get_current_user)
 ):
-    # 파일명 및 저장 경로
+    # 📁 저장 경로 생성
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"user{user.u_id}_{timestamp}_{file.filename}"
-    save_dir = os.path.join(BASE_UPLOAD_DIR, str(user.u_id), "audio")
+    save_dir = os.path.join(BASE_UPLOAD_DIR, str(user.u_id))
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, filename)
 
-    # 저장
+    # 📥 파일 저장
     with open(save_path, "wb") as f:
         f.write(await file.read())
 
-    # DB 기록
+    # ✅ note_id가 있으면 folder_id는 무시
+    folder_id_to_use = folder_id if note_id is None else None
+
+    # 📦 files 테이블에 기록
     new_file = FileModel(
         user_id=user.u_id,
-        folder_id=None,
+        folder_id=folder_id_to_use,
         original_name=filename,
         saved_path=save_path,
         content_type="audio"
@@ -288,33 +293,44 @@ async def upload_audio_file(
     db.commit()
     db.refresh(new_file)
 
-    # Whisper로 STT 수행
+    # 🧠 STT 처리
     try:
-        result = model.transcribe(save_path, language="ko")  # 언어 설정
+        import whisper
+        model = whisper.load_model("base")
+        result = model.transcribe(save_path, language="ko")
         transcript = result.get("text", "").strip()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STT 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"STT 처리 실패: {e}")
 
-    if not transcript:
-        raise HTTPException(status_code=500, detail="음성에서 텍스트를 추출할 수 없습니다.")
+    # 📝 노트 처리
+    if note_id:
+        # 기존 노트에 텍스트 추가
+        note = db.query(NoteModel).filter(
+            NoteModel.id == note_id,
+            NoteModel.user_id == user.u_id
+        ).first()
 
-    # 노트로 저장
-    try:
+        if not note:
+            raise HTTPException(status_code=404, detail="해당 노트를 찾을 수 없습니다.")
+
+        note.content = (note.content or "") + "\n\n" + transcript
+        note.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(note)
+
+    else:
+        # 새 노트 생성
         new_note = NoteModel(
             user_id=user.u_id,
-            folder_id=None,  # 선택적으로 연결
-            title=f"[음성 노트] {timestamp}",
+            folder_id=folder_id_to_use,
+            title="녹음 텍스트",
             content=transcript
         )
         db.add(new_note)
         db.commit()
         db.refresh(new_note)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"노트 저장 실패: {e}")
 
     return {
-        "message": "✅ 음성 업로드 및 노트 생성 성공",
-        "file_id": new_file.id,
-        "note_id": new_note.id,
+        "message": "STT 및 노트 저장 완료",
         "transcript": transcript
     }

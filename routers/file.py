@@ -175,11 +175,18 @@ def download_file(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="서버에 파일이 존재하지 않습니다.")
 
-    filename_star = file_obj.original_name
+    # filename_star = file_obj.original_name
+    # return FileResponse(
+    #     path=file_path,
+    #     media_type=file_obj.content_type,
+    #     headers={"Content-Disposition": f"inline; filename*=UTF-8''{filename_star}"}
+    # )
+     # FastAPI가 내부에서 UTF-8로 인코딩된 Content-Disposition 헤더를 생성해 줌
     return FileResponse(
         path=file_path,
         media_type=file_obj.content_type,
-        headers={"Content-Disposition": f"inline; filename*=UTF-8''{filename_star}"}
+        filename=file_obj.original_name,
+        background=None
     )
 
 

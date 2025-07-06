@@ -1,14 +1,18 @@
 import os
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
+import traceback
 
-from db import get_db
+from db import get_db, SessionLocal
 from models.note import Note
 from schemas.note import NoteCreate, NoteUpdate, NoteResponse, FavoriteUpdate
 from utils.jwt_utils import get_current_user
+from fastapi.responses import StreamingResponse 
+from utils.llm import stream_summary_with_langchain
 
 load_dotenv()
 HF_TOKEN = os.getenv("HF_API_TOKEN")
@@ -140,35 +144,39 @@ def toggle_favorite(
     db.refresh(note)
     return note
 
+def save_summary(note_id: int, text: str):
+    db2 = SessionLocal()
+    try:
+        tgt = db2.query(Note).filter(Note.id == note_id).first()
+        if tgt:
+            tgt.content = text
+            tgt.updated_at = datetime.utcnow()
+            db2.commit()
+    finally:
+        db2.close()
 
-# 8) 노트 요약 (LLM 호출)
-@router.post("/notes/{note_id}/summarize", response_model=NoteResponse)
-def summarize_note(
+@router.post("/notes/{note_id}/summarize")
+async def summarize_stream_langchain(
     note_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
-    note = db.query(Note).filter(
-        Note.id == note_id, Note.user_id == user.u_id
-    ).first()
-    if not note:
-        raise HTTPException(status_code=404, detail="Note not found")
+    note = db.query(Note).filter(Note.id == note_id, Note.user_id == user.u_id).first()
+    if not note or not (note.content or "").strip():
+        raise HTTPException(status_code=404, detail="요약 대상 없음")
 
-    original = note.content or ""
-    if not original.strip():
-        raise HTTPException(status_code=400, detail="내용이 비어 있어 요약할 수 없습니다.")
+    async def event_gen():
+        parts = []
+        async for sse in stream_summary_with_langchain(note.content):
+            parts.append(sse.removeprefix("data: ").strip())
+            yield sse.encode()                    
+        full = "".join(parts).strip()
+        if full:
+            background_tasks.add_task(save_summary, note.id, full)
 
-    # ────────────────────────────────────────────────────────────────────
-    # 실제 요약 함수 호출 (지연 임포트)
-    try:
-        from utils.llm import summarize_with_qwen3
-        summary_text = summarize_with_qwen3(original)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"요약 중 오류 발생: {e}")
-    # ────────────────────────────────────────────────────────────────────
-
-    note.content = summary_text
-    note.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(note)
-    return note
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"}
+    )

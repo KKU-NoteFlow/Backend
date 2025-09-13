@@ -268,10 +268,12 @@ async def ocr_and_create_note(
     note_id: Optional[int] = None
     if merged_text:
         try:
+            # 추가/변경: 노트 제목을 업로드한 파일 이름으로 설정 (확장자 제거)
+            base_title = os.path.splitext(filename)[0].strip() or "OCR 결과"
             new_note = NoteModel(
                 user_id=current_user.u_id,
                 folder_id=folder_id,
-                title="OCR 결과",
+                title=base_title,
                 content=merged_text,
             )
             db.add(new_note)

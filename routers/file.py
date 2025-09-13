@@ -1,58 +1,29 @@
 # ~/noteflow/Backend/routers/file.py
 
 import os
-import io
-import whisper
-model = whisper.load_model("base")
 from datetime import datetime
-import numpy as np
 from typing import Optional, List
-from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from PIL import Image
 
 from db import get_db
 from models.file import File as FileModel
 from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
 
-# -------------------------------
-# 1) EasyOCR 라이브러리 임포트 (GPU 모드 활성화)
-# -------------------------------
-import easyocr
-reader = easyocr.Reader(["ko", "en"], gpu=True)
+# 추가/변경: 공통 OCR 파이프라인(thin wrapper)
+from utils.ocr import run_pipeline, detect_type
+from schemas.file import OCRResponse
 
-# -------------------------------
-# 2) Hugging Face TrOCR 모델용 파이프라인 (GPU 사용)
-# -------------------------------
-from transformers import pipeline
-
-hf_trocr_printed = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-base-printed",
-    device=0,
-    trust_remote_code=True
-)
-hf_trocr_handwritten = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-base-handwritten",
-    device=0,
-    trust_remote_code=True
-)
-hf_trocr_small_printed = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-small-printed",
-    device=0,
-    trust_remote_code=True
-)
-hf_trocr_large_printed = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-large-printed",
-    device=0,
-    trust_remote_code=True
+# 추가: 허용 확장자 상수 (불일치 시 200 + warnings 응답)
+ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+ALLOWED_PDF_EXTS   = {".pdf"}
+ALLOWED_DOC_EXTS   = {".doc", ".docx"}
+ALLOWED_HWP_EXTS   = {".hwp"}
+ALLOWED_ALL_EXTS   = (
+    ALLOWED_IMAGE_EXTS | ALLOWED_PDF_EXTS | ALLOWED_DOC_EXTS | ALLOWED_HWP_EXTS
 )
 
 # 업로드 디렉토리 설정
@@ -65,6 +36,38 @@ os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
 
 router = APIRouter(prefix="/api/v1/files", tags=["Files"])
 
+@router.get("/ocr/diag", summary="OCR 런타임 의존성 진단")
+def ocr_dependency_diag():
+    import shutil, subprocess
+    def which(cmd: str):
+        return shutil.which(cmd) is not None
+    def run(cmd: list[str]):
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=5)
+            return out.decode(errors="ignore").strip()
+        except Exception as e:
+            return f"ERR: {e}"
+
+    tesseract_ok = which("tesseract")
+    poppler_ok = which("pdftoppm") or which("pdftocairo")
+    soffice_ok = which("soffice") or which("libreoffice")
+    hwp5txt_ok = which("hwp5txt")
+
+    langs = None
+    tess_ver = None
+    if tesseract_ok:
+        tess_ver = run(["tesseract", "--version"]).splitlines()[0] if tesseract_ok else None
+        langs_out = run(["tesseract", "--list-langs"])
+        langs = [l.strip() for l in langs_out.splitlines() if l and not l.lower().startswith("list of available")] if langs_out and not langs_out.startswith("ERR:") else None
+
+    return {
+        "tesseract": tesseract_ok,
+        "tesseract_version": tess_ver,
+        "tesseract_langs": langs,
+        "poppler": poppler_ok,
+        "libreoffice": soffice_ok,
+        "hwp5txt": hwp5txt_ok,
+    }
 
 @router.post(
     "/upload",
@@ -194,73 +197,94 @@ def download_file(
 
 @router.post(
     "/ocr",
-    summary="이미지 OCR → 텍스트 변환 후 노트 생성",
-    response_model=dict
+    summary="이미지/PDF/DOC/DOCX/HWP OCR → 텍스트 변환 후 노트 생성",
+    response_model=OCRResponse
 )
 async def ocr_and_create_note(
-    ocr_file: UploadFile = File(...),
+    # 변경: 업로드 필드명 'file' 기본 + 과거 호환 'ocr_file' 동시 허용
+    file: Optional[UploadFile] = File(None, description="기본 업로드 필드명"),
+    ocr_file: Optional[UploadFile] = File(None, description="과거 호환 업로드 필드명"),
     folder_id: Optional[int] = Form(None),
+    langs: str = Query("kor+eng", description="Tesseract 언어코드(예: kor+eng)"),
+    max_pages: int = Query(50, ge=1, le=500, description="최대 처리 페이지 수(기본 50)"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
     """
-    • EasyOCR + TrOCR 모델로 이미지에서 텍스트 추출
-    • 가장 긴 결과를 선택해 새 노트로 저장
+    변경 전: 이미지 전용 EasyOCR/TrOCR로 텍스트 추출 후 노트 생성.
+    변경 후(추가/변경): 공통 파이프라인(utils.ocr.run_pipeline)으로 이미지/PDF/DOC/DOCX/HWP 처리.
+    - 예외는 200으로 내려가며, results=[] + warnings에 사유 기입.
+    - 결과 텍스트를 합쳐 비어있지 않으면 기존과 동일하게 노트를 생성.
     """
-    # 1) 이미지 로드
-    contents = await ocr_file.read()
-    try:
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"이미지 처리 실패: {e}")
+    # 업로드 파일 결정
+    upload = file or ocr_file
+    if upload is None:
+        raise HTTPException(status_code=400, detail="업로드 파일이 필요합니다. 필드명은 'file' 또는 'ocr_file'을 사용하세요.")
 
-    # 2) EasyOCR
-    try:
-        image_np = np.array(image)
-        easy_results = reader.readtext(image_np)
-        easy_text = " ".join([res[1] for res in easy_results])
-    except Exception:
-        easy_text = ""
+    filename = upload.filename or "uploaded"
+    mime = upload.content_type
 
-    # 3) TrOCR 4개 모델
-    hf_texts: List[str] = []
-    try:
-        for pipe in (
-            hf_trocr_printed,
-            hf_trocr_handwritten,
-            hf_trocr_small_printed,
-            hf_trocr_large_printed
-        ):
-            out = pipe(image)
-            if isinstance(out, list) and "generated_text" in out[0]:
-                hf_texts.append(out[0]["generated_text"].strip())
-    except Exception:
-        pass
-
-    # 4) 가장 긴 결과 선택
-    candidates = [t for t in [easy_text] + hf_texts if t and t.strip()]
-    if not candidates:
-        raise HTTPException(status_code=500, detail="텍스트를 인식할 수 없습니다.")
-    ocr_text = max(candidates, key=len)
-
-    # 5) Note 생성
-    try:
-        new_note = NoteModel(
-            user_id=current_user.u_id,
-            folder_id=folder_id,
-            title="OCR 결과",
-            content=ocr_text
+    # 허용 확장자 확인 (불일치 시 200 + warnings)
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    if ext and ext not in ALLOWED_ALL_EXTS:
+        return OCRResponse(
+            filename=filename,
+            mime=mime,
+            page_count=0,
+            results=[],
+            warnings=[f"허용되지 않는 확장자({ext}). 허용: {sorted(ALLOWED_ALL_EXTS)}"],
+            note_id=None,
+            text=None,
         )
-        db.add(new_note)
-        db.commit()
-        db.refresh(new_note)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"노트 저장 실패: {e}")
 
-    return {
-        "note_id": new_note.id,
-        "text": ocr_text
-    }
+    # 타입 판별 (보조적으로 unknown 방지)
+    ftype = detect_type(filename, mime)
+    if ftype == "unknown":
+        return OCRResponse(
+            filename=filename,
+            mime=mime,
+            page_count=0,
+            results=[],
+            warnings=["지원되지 않는 파일 형식입니다."],
+            note_id=None,
+            text=None,
+        )
+
+    data = await upload.read()
+
+    pipe = run_pipeline(
+        filename=filename,
+        mime=mime,
+        data=data,
+        langs=langs,
+        max_pages=max_pages,
+    )
+
+    merged_text = "\n\n".join([
+        item.get("text", "") for item in (pipe.get("results") or []) if item.get("text")
+    ]).strip()
+
+    note_id: Optional[int] = None
+    if merged_text:
+        try:
+            new_note = NoteModel(
+                user_id=current_user.u_id,
+                folder_id=folder_id,
+                title="OCR 결과",
+                content=merged_text,
+            )
+            db.add(new_note)
+            db.commit()
+            db.refresh(new_note)
+            note_id = new_note.id
+        except Exception as e:
+            (pipe.setdefault("warnings", [])).append(f"노트 저장 실패: {e}")
+
+    pipe["note_id"] = note_id
+    pipe["text"] = merged_text or None
+
+    return pipe
 
 
 @router.post("/audio")
@@ -338,3 +362,10 @@ async def upload_audio_and_transcribe(
         "message": "STT 및 노트 저장 완료",
         "transcript": transcript
     }
+@router.options("/ocr")
+def ocr_cors_preflight() -> Response:
+    """CORS preflight용 OPTIONS 응답. 일부 프록시/클라이언트에서 405 회피.
+    변경 전: 별도 OPTIONS 라우트 없음(미들웨어에 의존)
+    변경 후(추가): 명시적으로 200을 반환
+    """
+    return Response(status_code=200)

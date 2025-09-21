@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
@@ -145,13 +145,24 @@ def toggle_favorite(
     return note
 
 def save_summary(note_id: int, text: str):
+    """Deprecated: kept for reference. No longer overwrites original note."""
     db2 = SessionLocal()
     try:
         tgt = db2.query(Note).filter(Note.id == note_id).first()
-        if tgt:
-            tgt.content = text
-            tgt.updated_at = datetime.utcnow()
-            db2.commit()
+        if not tgt:
+            return
+        # Create a new note in the same folder with title '<original>요약'
+        title = (tgt.title or "").strip() + "요약"
+        if len(title) > 255:
+            title = title[:255]
+        new_note = Note(
+            user_id=tgt.user_id,
+            folder_id=tgt.folder_id,
+            title=title,
+            content=text,
+        )
+        db2.add(new_note)
+        db2.commit()
     finally:
         db2.close()
 
@@ -159,6 +170,8 @@ def save_summary(note_id: int, text: str):
 async def summarize_stream_langchain(
     note_id: int,
     background_tasks: BackgroundTasks,
+    domain: str | None = Query(default=None, description="meeting | code | paper | general | auto(None)"),
+    longdoc: bool = Query(default=True, description="Enable long-document map→reduce"),
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
@@ -168,12 +181,29 @@ async def summarize_stream_langchain(
 
     async def event_gen():
         parts = []
-        async for sse in stream_summary_with_langchain(note.content):
+        async for sse in stream_summary_with_langchain(note.content, domain=domain, longdoc=longdoc):
             parts.append(sse.removeprefix("data: ").strip())
             yield sse.encode()                    
         full = "".join(parts).strip()
         if full:
-            background_tasks.add_task(save_summary, note.id, full)
+            # Create a new summary note in the same folder with title '<original>요약'
+            title = (note.title or "").strip() + "요약"
+            if len(title) > 255:
+                title = title[:255]
+            new_note = Note(
+                user_id=user.u_id,
+                folder_id=note.folder_id,
+                title=title,
+                content=full,
+            )
+            db.add(new_note)
+            db.commit()
+            db.refresh(new_note)
+            try:
+                # Optional: notify created note id
+                yield f"data: SUMMARY_NOTE_ID:{new_note.id}\n\n".encode()
+            except Exception:
+                pass
 
     return StreamingResponse(
         event_gen(),

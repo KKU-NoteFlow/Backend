@@ -1,5 +1,3 @@
-# ~/noteflow/Backend/routers/file.py
-
 import os
 from datetime import datetime
 from typing import Optional, List
@@ -71,11 +69,12 @@ def ocr_dependency_diag():
 
 @router.post(
     "/upload",
-    summary="폴더에 파일 업로드",
+    summary="폴더/노트에 파일 업로드 (note_id 있으면 노트 본문에도 삽입)",
     status_code=status.HTTP_201_CREATED
 )
 async def upload_file(
     folder_id: Optional[int] = Form(None),
+    note_id: Optional[int] = Form(None),
     upload_file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
@@ -87,7 +86,7 @@ async def upload_file(
     user_dir = os.path.join(BASE_UPLOAD_DIR, str(current_user.u_id))
     os.makedirs(user_dir, exist_ok=True)
 
-    # 원본 파일명 그대로 저장 (동명이인 방지)
+    # 원본 파일명 그대로 저장 (중복 시 _1, _2 붙임)
     saved_filename = orig_filename
     saved_path = os.path.join(user_dir, saved_filename)
     if os.path.exists(saved_path):
@@ -110,10 +109,22 @@ async def upload_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"파일 저장 실패: {e}")
 
+    # note_id가 있으면 해당 노트 확인
+    note_obj = None
+    if note_id is not None:
+        note_obj = (
+            db.query(NoteModel)
+            .filter(NoteModel.id == note_id, NoteModel.user_id == current_user.u_id)
+            .first()
+        )
+        if not note_obj:
+            raise HTTPException(status_code=404, detail="해당 노트를 찾을 수 없습니다.")
+
     # DB에 메타데이터 기록
     new_file = FileModel(
         user_id=current_user.u_id,
-        folder_id=folder_id,
+        folder_id=None if note_id else folder_id,
+        note_id=note_id,
         original_name=orig_filename,
         saved_path=saved_path,
         content_type=content_type
@@ -125,11 +136,25 @@ async def upload_file(
     base_url = os.getenv("BASE_API_URL", "http://localhost:8000")
     download_url = f"{base_url}/api/v1/files/download/{new_file.id}"
 
+    # note_id가 있으면 content에도 삽입
+    if note_obj:
+        if content_type.startswith("image/"):
+            embed = f"\n\n![{new_file.original_name}]({download_url})\n\n"
+        elif content_type == "application/pdf":
+            embed = f"\n\n[{new_file.original_name}]({download_url}) (PDF 보기)\n\n"
+        else:
+            embed = f"\n\n[{new_file.original_name}]({download_url})\n\n"
+
+        note_obj.content = (note_obj.content or "") + embed
+        db.commit()
+        db.refresh(note_obj)
+
     return {
         "file_id": new_file.id,
         "url": download_url,
         "original_name": new_file.original_name,
         "folder_id": new_file.folder_id,
+        "note_id": new_file.note_id,
         "content_type": new_file.content_type,
         "created_at": new_file.created_at
     }
@@ -180,13 +205,6 @@ def download_file(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="서버에 파일이 존재하지 않습니다.")
 
-    # filename_star = file_obj.original_name
-    # return FileResponse(
-    #     path=file_path,
-    #     media_type=file_obj.content_type,
-    #     headers={"Content-Disposition": f"inline; filename*=UTF-8''{filename_star}"}
-    # )
-     # FastAPI가 내부에서 UTF-8로 인코딩된 Content-Disposition 헤더를 생성해 줌
     return FileResponse(
         path=file_path,
         media_type=file_obj.content_type,
@@ -201,7 +219,6 @@ def download_file(
     response_model=OCRResponse
 )
 async def ocr_and_create_note(
-    # 변경: 업로드 필드명 'file' 기본 + 과거 호환 'ocr_file' 동시 허용
     file: Optional[UploadFile] = File(None, description="기본 업로드 필드명"),
     ocr_file: Optional[UploadFile] = File(None, description="과거 호환 업로드 필드명"),
     folder_id: Optional[int] = Form(None),
@@ -210,13 +227,6 @@ async def ocr_and_create_note(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """
-    변경 전: 이미지 전용 EasyOCR/TrOCR로 텍스트 추출 후 노트 생성.
-    변경 후(추가/변경): 공통 파이프라인(utils.ocr.run_pipeline)으로 이미지/PDF/DOC/DOCX/HWP 처리.
-    - 예외는 200으로 내려가며, results=[] + warnings에 사유 기입.
-    - 결과 텍스트를 합쳐 비어있지 않으면 기존과 동일하게 노트를 생성.
-    """
-    # 업로드 파일 결정
     upload = file or ocr_file
     if upload is None:
         raise HTTPException(status_code=400, detail="업로드 파일이 필요합니다. 필드명은 'file' 또는 'ocr_file'을 사용하세요.")
@@ -224,7 +234,6 @@ async def ocr_and_create_note(
     filename = upload.filename or "uploaded"
     mime = upload.content_type
 
-    # 허용 확장자 확인 (불일치 시 200 + warnings)
     _, ext = os.path.splitext(filename)
     ext = ext.lower()
     if ext and ext not in ALLOWED_ALL_EXTS:
@@ -238,7 +247,6 @@ async def ocr_and_create_note(
             text=None,
         )
 
-    # 타입 판별 (보조적으로 unknown 방지)
     ftype = detect_type(filename, mime)
     if ftype == "unknown":
         return OCRResponse(
@@ -268,7 +276,6 @@ async def ocr_and_create_note(
     note_id: Optional[int] = None
     if merged_text:
         try:
-            # 추가/변경: 노트 제목을 업로드한 파일 이름으로 설정 (확장자 제거)
             base_title = os.path.splitext(filename)[0].strip() or "OCR 결과"
             new_note = NoteModel(
                 user_id=current_user.u_id,
@@ -297,24 +304,21 @@ async def upload_audio_and_transcribe(
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-    # 📁 저장 경로 생성
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"user{user.u_id}_{timestamp}_{file.filename}"
     save_dir = os.path.join(BASE_UPLOAD_DIR, str(user.u_id))
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, filename)
 
-    # 📥 파일 저장
     with open(save_path, "wb") as f:
         f.write(await file.read())
 
-    # ✅ note_id가 있으면 folder_id는 무시
     folder_id_to_use = folder_id if note_id is None else None
 
-    # 📦 files 테이블에 기록
     new_file = FileModel(
         user_id=user.u_id,
         folder_id=folder_id_to_use,
+        note_id=note_id,
         original_name=filename,
         saved_path=save_path,
         content_type="audio"
@@ -323,7 +327,6 @@ async def upload_audio_and_transcribe(
     db.commit()
     db.refresh(new_file)
 
-    # 🧠 STT 처리
     try:
         import whisper
         model = whisper.load_model("base")
@@ -332,9 +335,7 @@ async def upload_audio_and_transcribe(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT 처리 실패: {e}")
 
-    # 📝 노트 처리
     if note_id:
-        # 기존 노트에 텍스트 추가
         note = db.query(NoteModel).filter(
             NoteModel.id == note_id,
             NoteModel.user_id == user.u_id
@@ -349,7 +350,6 @@ async def upload_audio_and_transcribe(
         db.refresh(note)
 
     else:
-        # 새 노트 생성
         new_note = NoteModel(
             user_id=user.u_id,
             folder_id=folder_id_to_use,
@@ -364,10 +364,7 @@ async def upload_audio_and_transcribe(
         "message": "STT 및 노트 저장 완료",
         "transcript": transcript
     }
+
 @router.options("/ocr")
 def ocr_cors_preflight() -> Response:
-    """CORS preflight용 OPTIONS 응답. 일부 프록시/클라이언트에서 405 회피.
-    변경 전: 별도 OPTIONS 라우트 없음(미들웨어에 의존)
-    변경 후(추가): 명시적으로 200을 반환
-    """
     return Response(status_code=200)

@@ -1,26 +1,17 @@
-from sqlalchemy import Column, Integer, String, Enum, TIMESTAMP, text
+from sqlalchemy import Column, Integer, String, Boolean, TIMESTAMP, ForeignKey, text
 from sqlalchemy.orm import relationship
+from .base import Base
 
-class User(Base):
-    __tablename__ = "user"
+class Checklist(Base):
+    __tablename__ = "checklist"
 
-    u_id = Column(Integer, primary_key=True, autoincrement=True)  # PK
-    id = Column(String(50), unique=True, nullable=False)          # 로그인 ID
-    email = Column(String(150), unique=True, nullable=False)
-    password = Column(String(255), nullable=False)
-    provider = Column(
-        Enum("local", "google", "kakao", "naver", name="provider_enum"),
-        nullable=False,
-        server_default="local",
-    )
-    created_at = Column(
-        TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP")
-    )
-    updated_at = Column(
-        TIMESTAMP,
-        nullable=False,
-        server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
-    )
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    user_id    = Column(Integer, ForeignKey("user.u_id", ondelete="CASCADE"), nullable=False)
+    title      = Column(String(255), nullable=False)
+    is_clear   = Column(Boolean, nullable=False, server_default=text("0"))
+    created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(TIMESTAMP, nullable=False,
+                        server_default=text("CURRENT_TIMESTAMP"),
+                        onupdate=text("CURRENT_TIMESTAMP"))
 
-    # 역참조: checklist 목록
-    checklists = relationship("Checklist", back_populates="user", cascade="all, delete-orphan")
+    user = relationship("User", back_populates="checklists")

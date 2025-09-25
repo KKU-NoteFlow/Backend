@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 from typing import Optional, List
 
@@ -11,28 +12,23 @@ from models.file import File as FileModel
 from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
 
-# 추가/변경: 공통 OCR 파이프라인(thin wrapper)
+# 공통 OCR 파이프라인
 from utils.ocr import run_pipeline, detect_type
 from schemas.file import OCRResponse
 
-# 추가: 허용 확장자 상수 (불일치 시 200 + warnings 응답)
+# 허용 확장자
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 ALLOWED_PDF_EXTS   = {".pdf"}
 ALLOWED_DOC_EXTS   = {".doc", ".docx"}
 ALLOWED_HWP_EXTS   = {".hwp"}
-ALLOWED_ALL_EXTS   = (
-    ALLOWED_IMAGE_EXTS | ALLOWED_PDF_EXTS | ALLOWED_DOC_EXTS | ALLOWED_HWP_EXTS
-)
+ALLOWED_ALL_EXTS   = (ALLOWED_IMAGE_EXTS | ALLOWED_PDF_EXTS | ALLOWED_DOC_EXTS | ALLOWED_HWP_EXTS)
 
-# 업로드 디렉토리 설정
-BASE_UPLOAD_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "uploads"
-)
+# 업로드 디렉토리
+BASE_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "uploads")
 os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
 
 router = APIRouter(prefix="/api/v1/files", tags=["Files"])
+
 
 @router.get("/ocr/diag", summary="OCR 런타임 의존성 진단")
 def ocr_dependency_diag():
@@ -67,6 +63,7 @@ def ocr_dependency_diag():
         "hwp5txt": hwp5txt_ok,
     }
 
+
 @router.post(
     "/upload",
     summary="폴더/노트에 파일 업로드 (note_id 있으면 노트 본문에도 삽입)",
@@ -86,7 +83,7 @@ async def upload_file(
     user_dir = os.path.join(BASE_UPLOAD_DIR, str(current_user.u_id))
     os.makedirs(user_dir, exist_ok=True)
 
-    # 원본 파일명 그대로 저장 (중복 시 _1, _2 붙임)
+    # 원본 파일명 유지 (중복 방지)
     saved_filename = orig_filename
     saved_path = os.path.join(user_dir, saved_filename)
     if os.path.exists(saved_path):
@@ -101,7 +98,7 @@ async def upload_file(
                 break
             counter += 1
 
-    # 파일 저장
+    # 저장
     try:
         with open(saved_path, "wb") as buffer:
             content = await upload_file.read()
@@ -120,7 +117,7 @@ async def upload_file(
         if not note_obj:
             raise HTTPException(status_code=404, detail="해당 노트를 찾을 수 없습니다.")
 
-    # DB에 메타데이터 기록
+    # DB 메타 기록
     new_file = FileModel(
         user_id=current_user.u_id,
         folder_id=None if note_id else folder_id,
@@ -136,7 +133,7 @@ async def upload_file(
     base_url = os.getenv("BASE_API_URL", "http://localhost:8000")
     download_url = f"{base_url}/api/v1/files/download/{new_file.id}"
 
-    # note_id가 있으면 content에도 삽입
+    # note_id가 있으면 노트 본문에 첨부 링크 삽입
     if note_obj:
         if content_type.startswith("image/"):
             embed = f"\n\n![{new_file.original_name}]({download_url})\n\n"
@@ -213,6 +210,36 @@ def download_file(
     )
 
 
+# ---------------------------
+# 언어코드 유연 처리 유틸
+# ---------------------------
+LANG_ALIAS = {
+    "ko": "kor", "kr": "kor", "korean": "kor",
+    "en": "eng", "english": "eng"
+}
+def normalize_langs(raw: str) -> str:
+    """
+    입력 예: 'koreng', 'kor,eng', 'ko+en', 'ko,en', 'korean+english'
+    출력 예: 'kor+eng'
+    """
+    if not raw:
+        return "kor+eng"
+    s = raw.strip().lower().replace(" ", "")
+    s = re.sub(r"[,_;]+", "+", s)
+    if "+" not in s:
+        s = s.replace("koreng", "kor+eng").replace("koen", "ko+en")
+    parts = [p for p in s.split("+") if p]
+    norm: list[str] = []
+    for p in parts:
+        norm.append(LANG_ALIAS.get(p, p))
+    # 중복 제거(순서 보존)
+    seen, out = set(), []
+    for p in norm:
+        if p not in seen:
+            seen.add(p); out.append(p)
+    return "+".join(out) if out else "kor+eng"
+
+
 @router.post(
     "/ocr",
     summary="이미지/PDF/DOC/DOCX/HWP OCR → 텍스트 변환 후 노트 생성",
@@ -222,18 +249,23 @@ async def ocr_and_create_note(
     file: Optional[UploadFile] = File(None, description="기본 업로드 필드명"),
     ocr_file: Optional[UploadFile] = File(None, description="과거 호환 업로드 필드명"),
     folder_id: Optional[int] = Form(None),
-    langs: str = Query("kor+eng", description="Tesseract 언어코드(예: kor+eng)"),
+    langs: str = Query("kor+eng", description="Tesseract 언어코드(유연 입력 허용: koreng, ko+en 등)"),
     max_pages: int = Query(50, ge=1, le=500, description="최대 처리 페이지 수(기본 50)"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    # 422 방지: 파일 필드명 유연 처리
     upload = file or ocr_file
     if upload is None:
-        raise HTTPException(status_code=400, detail="업로드 파일이 필요합니다. 필드명은 'file' 또는 'ocr_file'을 사용하세요.")
+        raise HTTPException(
+            status_code=400,
+            detail="업로드 파일이 필요합니다. 필드명은 'file' 또는 'ocr_file'을 사용하세요."
+        )
 
     filename = upload.filename or "uploaded"
     mime = upload.content_type
 
+    # 확장자 검사
     _, ext = os.path.splitext(filename)
     ext = ext.lower()
     if ext and ext not in ALLOWED_ALL_EXTS:
@@ -247,6 +279,7 @@ async def ocr_and_create_note(
             text=None,
         )
 
+    # 타입 판별
     ftype = detect_type(filename, mime)
     if ftype == "unknown":
         return OCRResponse(
@@ -261,6 +294,10 @@ async def ocr_and_create_note(
 
     data = await upload.read()
 
+    # 언어코드 정규화
+    langs = normalize_langs(langs)
+
+    # 멀티엔진 앙상블 OCR 파이프라인 실행
     pipe = run_pipeline(
         filename=filename,
         mime=mime,
@@ -269,6 +306,7 @@ async def ocr_and_create_note(
         max_pages=max_pages,
     )
 
+    # 페이지 텍스트 합치기
     merged_text = "\n\n".join([
         item.get("text", "") for item in (pipe.get("results") or []) if item.get("text")
     ]).strip()
@@ -364,6 +402,7 @@ async def upload_audio_and_transcribe(
         "message": "STT 및 노트 저장 완료",
         "transcript": transcript
     }
+
 
 @router.options("/ocr")
 def ocr_cors_preflight() -> Response:

@@ -1,47 +1,26 @@
-# 변경/설명:
-# - POST /checklists : 생성 전용
-# - PATCH /checklists/{id}/clear : is_clear 0/1 설정
-# - get_current_user는 user.u_id 제공 가정
+# Backend/routers/checklist.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from db import get_db
+from models.checklist import Checklist
+from utils.jwt_utils import get_current_user
 
-from app.schemas.checklist import ChecklistCreate, ChecklistClearUpdate
-from app.models import Checklist  # Checklist(u_id, checklist_title, is_clear)
-from app.dependencies import get_db, get_current_user
-
-router = APIRouter(prefix="/checklists", tags=["checklists"])
+router = APIRouter(prefix="/api/v1/checklists", tags=["Checklists"])
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_checklist(
-    req: ChecklistCreate,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    obj = Checklist(
-        u_id=user.u_id,                 # ← 프로젝트의 사용자 키에 맞게
-        checklist_title=req.checklist_title,
-        is_clear=0                      # 기본 0(미완)
-    )
+def create_checklist(title: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    obj = Checklist(user_id=user.u_id, title=title, is_clear=False)
     db.add(obj)
     db.commit()
     db.refresh(obj)
-    return {"id": obj.id, "checklist_title": obj.checklist_title, "is_clear": obj.is_clear}
+    return {"id": obj.id, "title": obj.title, "is_clear": obj.is_clear}
 
 @router.patch("/{checklist_id}/clear")
-def set_clear_state(
-    checklist_id: int,
-    req: ChecklistClearUpdate,          # {"is_clear": 0 | 1}
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user),
-):
-    obj = (
-        db.query(Checklist)
-          .filter(Checklist.id == checklist_id, Checklist.u_id == user.u_id)
-          .first()
-    )
+def set_clear_state(checklist_id: int, is_clear: bool, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    obj = db.query(Checklist).filter(Checklist.id == checklist_id, Checklist.user_id == user.u_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Checklist not found")
-    obj.is_clear = int(req.is_clear)    # 0/1 저장
+    obj.is_clear = bool(is_clear)
     db.commit()
     db.refresh(obj)
     return {"id": obj.id, "is_clear": obj.is_clear}

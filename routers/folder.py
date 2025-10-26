@@ -1,11 +1,13 @@
 # Backend/routers/folder.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import os
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from db import get_db
 from models.folder import Folder
 from models.note import Note
+from models.file import File as FileModel
 from schemas.folder import FolderCreate, FolderResponse, FolderUpdate
 from schemas.note import NoteResponse
 from utils.jwt_utils import get_current_user
@@ -40,6 +42,7 @@ def get_all_descendant_folder_ids(db: Session, parent_id: int, user_id: int) -> 
     summary="유저의 모든 폴더(트리 구조) 및 폴더별 노트 리스트 반환"
 )
 def list_folders(
+    request: Request,
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
@@ -71,7 +74,49 @@ def list_folders(
         else:
             roots.append(f)
 
-    return roots
+    BASE_API_URL = os.getenv("BASE_API_URL") or str(request.base_url).rstrip('/')
+
+    def serialize_note(note: Note) -> NoteResponse:
+        files = (
+            db.query(FileModel)
+            .filter(FileModel.note_id == note.id, FileModel.user_id == note.user_id)
+            .order_by(FileModel.created_at.desc())
+            .all()
+        )
+        file_items = [
+            {
+                "file_id": f.id,
+                "original_name": f.original_name,
+                "content_type": f.content_type,
+                "url": f"{BASE_API_URL}/api/v1/files/download/{f.id}",
+                "created_at": f.created_at,
+            }
+            for f in files
+        ]
+        return NoteResponse(
+            id=note.id,
+            user_id=note.user_id,
+            folder_id=note.folder_id,
+            title=note.title,
+            content=note.content,
+            is_favorite=bool(note.is_favorite),
+            last_accessed=note.last_accessed,
+            created_at=note.created_at,
+            updated_at=note.updated_at,
+            files=file_items,
+        )
+
+    def to_folder_response(f: Folder) -> FolderResponse:
+        return FolderResponse(
+            id=f.id,
+            user_id=f.user_id,
+            name=f.name,
+            parent_id=f.parent_id,
+            children=[to_folder_response(c) for c in getattr(f, 'children', [])],
+            notes=[serialize_note(n) for n in folder_note_map.get(f.id, [])],
+        )
+
+    return [to_folder_response(r) for r in roots]
 
 
 @router.post(

@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query, Response
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query, Response, Request
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -11,55 +11,17 @@ from db import get_db
 from models.file import File as FileModel
 from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
-
-cuda_gpu
-# 추가: 파일명 인코딩용
 import urllib.parse
 
-# -------------------------------
-# 1) EasyOCR 라이브러리 임포트 (GPU 모드 활성화)
-# -------------------------------
-import easyocr
-reader = easyocr.Reader(["ko", "en"], gpu=True)
-
-# -------------------------------
-# 2) Hugging Face TrOCR 모델용 파이프라인 (GPU 사용)
-# -------------------------------
-from transformers import pipeline
-
-hf_trocr_printed = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-base-printed",
-    device=0,
-    trust_remote_code=True
-)
-hf_trocr_handwritten = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-base-handwritten",
-    device=0,
-    trust_remote_code=True
-)
-hf_trocr_small_printed = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-small-printed",
-    device=0,
-    trust_remote_code=True
-)
-hf_trocr_large_printed = pipeline(
-    "image-to-text",
-    model="microsoft/trocr-large-printed",
-    device=0,
-    trust_remote_code=True
-)
-
-BASE_UPLOAD_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "uploads"
-)
-
-# 공통 OCR 파이프라인
-from utils.ocr import run_pipeline, detect_type
+# 공통 OCR 파이프라인 (내부 유틸로 위임) — 안전 임포트
+try:
+    from utils.ocr import run_pipeline, detect_type
+except ModuleNotFoundError:
+    import sys as _sys, os as _os
+    _ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".."))
+    if _ROOT not in _sys.path:
+        _sys.path.insert(0, _ROOT)
+    from utils.ocr import run_pipeline, detect_type
 from schemas.file import OCRResponse
 
 # 허용 확장자
@@ -96,9 +58,9 @@ def ocr_dependency_diag():
     langs = None
     tess_ver = None
     if tesseract_ok:
-        tess_ver = run(["tesseract", "--version"]).splitlines()[0] if tesseract_ok else None
+        tess_ver = run(["tesseract", "--version"]).splitlines()[0]
         langs_out = run(["tesseract", "--list-langs"])
-        langs = [l.strip() for l in langs_out.splitlines() if l and not l.lower().startswith("list of available")] if langs_out and not langs_out.startswith("ERR:") else None
+        langs = [l.strip() for l in langs_out.splitlines() if l and not l.lower().startswith("list of available")]
 
     return {
         "tesseract": tesseract_ok,
@@ -120,14 +82,14 @@ async def upload_file(
     note_id: Optional[int] = Form(None),
     upload_file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    request: Request = None,
 ):
     orig_filename: str = upload_file.filename or "unnamed"
     content_type: str = upload_file.content_type or "application/octet-stream"
 
     user_dir = os.path.join(BASE_UPLOAD_DIR, str(current_user.u_id))
     os.makedirs(user_dir, exist_ok=True)
-
 
     saved_filename = orig_filename
     saved_path = os.path.join(user_dir, saved_filename)
@@ -143,16 +105,13 @@ async def upload_file(
                 break
             counter += 1
 
-
     # 저장
-
     try:
         with open(saved_path, "wb") as buffer:
             content = await upload_file.read()
             buffer.write(content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"파일 저장 실패: {e}")
-
 
     # note_id가 있으면 해당 노트 확인
     note_obj = None
@@ -166,7 +125,6 @@ async def upload_file(
             raise HTTPException(status_code=404, detail="해당 노트를 찾을 수 없습니다.")
 
     # DB 메타 기록
-
     new_file = FileModel(
         user_id=current_user.u_id,
         folder_id=None if note_id else folder_id,
@@ -179,8 +137,12 @@ async def upload_file(
     db.commit()
     db.refresh(new_file)
 
-    base_url = os.getenv("BASE_API_URL", "http://localhost:8000")
+    # Prefer request base_url if available; fallback to env
+    base_url = (str(request.base_url).rstrip('/') if request else None) or os.getenv("BASE_API_URL", "http://localhost:8000")
     download_url = f"{base_url}/api/v1/files/download/{new_file.id}"
+    public_url = None
+    if content_type.startswith("image/"):
+        public_url = f"{base_url}/static/{current_user.u_id}/{urllib.parse.quote(saved_filename)}"
 
     # note_id가 있으면 노트 본문에 첨부 링크 삽입
     if note_obj:
@@ -190,7 +152,6 @@ async def upload_file(
             embed = f"\n\n[{new_file.original_name}]({download_url}) (PDF 보기)\n\n"
         else:
             embed = f"\n\n[{new_file.original_name}]({download_url})\n\n"
-
         note_obj.content = (note_obj.content or "") + embed
         db.commit()
         db.refresh(note_obj)
@@ -198,6 +159,7 @@ async def upload_file(
     return {
         "file_id": new_file.id,
         "url": download_url,
+        "public_url": public_url,
         "original_name": new_file.original_name,
         "folder_id": new_file.folder_id,
         "note_id": new_file.note_id,
@@ -251,10 +213,6 @@ def download_file(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="서버에 파일이 존재하지 않습니다.")
 
-    # 원본 파일명 UTF-8 URL 인코딩 처리
-    quoted_name = urllib.parse.quote(file_obj.original_name, safe='')
-    content_disposition = f"inline; filename*=UTF-8''{quoted_name}"  
-
     return FileResponse(
         path=file_path,
         media_type=file_obj.content_type,
@@ -271,10 +229,6 @@ LANG_ALIAS = {
     "en": "eng", "english": "eng"
 }
 def normalize_langs(raw: str) -> str:
-    """
-    입력 예: 'koreng', 'kor,eng', 'ko+en', 'ko,en', 'korean+english'
-    출력 예: 'kor+eng'
-    """
     if not raw:
         return "kor+eng"
     s = raw.strip().lower().replace(" ", "")
@@ -285,7 +239,6 @@ def normalize_langs(raw: str) -> str:
     norm: list[str] = []
     for p in parts:
         norm.append(LANG_ALIAS.get(p, p))
-    # 중복 제거(순서 보존)
     seen, out = set(), []
     for p in norm:
         if p not in seen:
@@ -302,84 +255,17 @@ async def ocr_and_create_note(
     file: Optional[UploadFile] = File(None, description="기본 업로드 필드명"),
     ocr_file: Optional[UploadFile] = File(None, description="과거 호환 업로드 필드명"),
     folder_id: Optional[int] = Form(None),
-    langs: str = Query("kor+eng", description="Tesseract 언어코드(유연 입력 허용: koreng, ko+en 등)"),
-    max_pages: int = Query(50, ge=1, le=500, description="최대 처리 페이지 수(기본 50)"),
+    langs: str = Query("kor+eng", description="언어코드"),
+    max_pages: int = Query(50, ge=1, le=500, description="최대 페이지 수"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-
-    """
-    • ocr_file: 이미지 파일(UploadFile)
-    • 1) EasyOCR로 기본 텍스트 추출 (GPU 모드)
-    • 2) TrOCR 4개 모델로 OCR 수행 (모두 GPU)
-    • 3) 가장 긴 결과를 최종 OCR 결과로 선택
-    • 4) Note로 저장 및 결과 반환
-    """
-
-    # 1) 이미지 로드 (PIL)
-    contents = await ocr_file.read()
-    try:
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"이미지 처리 실패: {e}")
-
-    # 2) EasyOCR로 텍스트 추출
-    try:
-        image_np = np.array(image)
-        easy_results = reader.readtext(image_np)  # GPU 모드 사용
-        easy_text = " ".join([res[1] for res in easy_results])
-    except Exception:
-        easy_text = ""
-
-    # 3) TrOCR 모델 4개로 OCR 수행 (모두 GPU input)
-    hf_texts: List[str] = []
-    try:
-        out1 = hf_trocr_printed(image)
-        if isinstance(out1, list) and "generated_text" in out1[0]:
-            hf_texts.append(out1[0]["generated_text"].strip())
-
-        out2 = hf_trocr_handwritten(image)
-        if isinstance(out2, list) and "generated_text" in out2[0]:
-            hf_texts.append(out2[0]["generated_text"].strip())
-
-        out3 = hf_trocr_small_printed(image)
-        if isinstance(out3, list) and "generated_text" in out3[0]:
-            hf_texts.append(out3[0]["generated_text"].strip())
-
-        out4 = hf_trocr_large_printed(image)
-        if isinstance(out4, list) and "generated_text" in out4[0]:
-            hf_texts.append(out4[0]["generated_text"].strip())
-    except Exception:
-        # TrOCR 중 오류 발생 시 무시하고 계속 진행
-        pass
-
-    # 4) 여러 OCR 결과 병합: 가장 긴 문자열을 최종 ocr_text로 선택
-    candidates = [t for t in [easy_text] + hf_texts if t and t.strip()]
-    if not candidates:
-        raise HTTPException(status_code=500, detail="텍스트를 인식할 수 없습니다.")
-
-    ocr_text = max(candidates, key=lambda s: len(s))
-
-    # 5) 새 노트 생성 및 DB에 저장
-    try:
-        new_note = NoteModel(
-            user_id=current_user.u_id,
-            folder_id=folder_id,
-            title="OCR 결과",
-            content=ocr_text  # **원본 OCR 텍스트만 저장**
-
-    # 422 방지: 파일 필드명 유연 처리
     upload = file or ocr_file
     if upload is None:
-        raise HTTPException(
-            status_code=400,
-            detail="업로드 파일이 필요합니다. 필드명은 'file' 또는 'ocr_file'을 사용하세요."
-        )
+        raise HTTPException(status_code=400, detail="파일이 필요합니다.")
 
     filename = upload.filename or "uploaded"
-    mime = upload.content_type
-
-    # 확장자 검사
+    mime = upload.content_type or "application/octet-stream"
     _, ext = os.path.splitext(filename)
     ext = ext.lower()
     if ext and ext not in ALLOWED_ALL_EXTS:
@@ -388,31 +274,14 @@ async def ocr_and_create_note(
             mime=mime,
             page_count=0,
             results=[],
-            warnings=[f"허용되지 않는 확장자({ext}). 허용: {sorted(ALLOWED_ALL_EXTS)}"],
-            note_id=None,
-            text=None,
-
-        )
-
-    # 타입 판별
-    ftype = detect_type(filename, mime)
-    if ftype == "unknown":
-        return OCRResponse(
-            filename=filename,
-            mime=mime,
-            page_count=0,
-            results=[],
-            warnings=["지원되지 않는 파일 형식입니다."],
+            warnings=[f"허용되지 않는 확장자({ext})."],
             note_id=None,
             text=None,
         )
 
     data = await upload.read()
-
-    # 언어코드 정규화
     langs = normalize_langs(langs)
 
-    # 멀티엔진 앙상블 OCR 파이프라인 실행
     pipe = run_pipeline(
         filename=filename,
         mime=mime,
@@ -421,7 +290,6 @@ async def ocr_and_create_note(
         max_pages=max_pages,
     )
 
-    # 페이지 텍스트 합치기
     merged_text = "\n\n".join([
         item.get("text", "") for item in (pipe.get("results") or []) if item.get("text")
     ]).strip()
@@ -445,7 +313,6 @@ async def ocr_and_create_note(
 
     pipe["note_id"] = note_id
     pipe["text"] = merged_text or None
-
     return pipe
 
 
@@ -493,15 +360,12 @@ async def upload_audio_and_transcribe(
             NoteModel.id == note_id,
             NoteModel.user_id == user.u_id
         ).first()
-
         if not note:
             raise HTTPException(status_code=404, detail="해당 노트를 찾을 수 없습니다.")
-
         note.content = (note.content or "") + "\n\n" + transcript
         note.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(note)
-
     else:
         new_note = NoteModel(
             user_id=user.u_id,
@@ -513,10 +377,7 @@ async def upload_audio_and_transcribe(
         db.commit()
         db.refresh(new_note)
 
-    return {
-        "message": "STT 및 노트 저장 완료",
-        "transcript": transcript
-    }
+    return {"message": "STT 및 노트 저장 완료", "transcript": transcript}
 
 
 @router.options("/ocr")

@@ -1,22 +1,18 @@
-# routers/file.py
 import os
-import io
-import whisper
-model = whisper.load_model("base")
+import re
 from datetime import datetime
-import numpy as np
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from PIL import Image
 
 from db import get_db
 from models.file import File as FileModel
 from models.note import Note as NoteModel
 from utils.jwt_utils import get_current_user
 
+cuda_gpu
 # 추가: 파일명 인코딩용
 import urllib.parse
 
@@ -61,18 +57,67 @@ BASE_UPLOAD_DIR = os.path.join(
     "..",
     "uploads"
 )
+
+# 공통 OCR 파이프라인
+from utils.ocr import run_pipeline, detect_type
+from schemas.file import OCRResponse
+
+# 허용 확장자
+ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+ALLOWED_PDF_EXTS   = {".pdf"}
+ALLOWED_DOC_EXTS   = {".doc", ".docx"}
+ALLOWED_HWP_EXTS   = {".hwp"}
+ALLOWED_ALL_EXTS   = (ALLOWED_IMAGE_EXTS | ALLOWED_PDF_EXTS | ALLOWED_DOC_EXTS | ALLOWED_HWP_EXTS)
+
+# 업로드 디렉토리
+BASE_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "uploads")
 os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
 
 router = APIRouter(prefix="/api/v1/files", tags=["Files"])
 
 
+@router.get("/ocr/diag", summary="OCR 런타임 의존성 진단")
+def ocr_dependency_diag():
+    import shutil, subprocess
+    def which(cmd: str):
+        return shutil.which(cmd) is not None
+    def run(cmd: list[str]):
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=5)
+            return out.decode(errors="ignore").strip()
+        except Exception as e:
+            return f"ERR: {e}"
+
+    tesseract_ok = which("tesseract")
+    poppler_ok = which("pdftoppm") or which("pdftocairo")
+    soffice_ok = which("soffice") or which("libreoffice")
+    hwp5txt_ok = which("hwp5txt")
+
+    langs = None
+    tess_ver = None
+    if tesseract_ok:
+        tess_ver = run(["tesseract", "--version"]).splitlines()[0] if tesseract_ok else None
+        langs_out = run(["tesseract", "--list-langs"])
+        langs = [l.strip() for l in langs_out.splitlines() if l and not l.lower().startswith("list of available")] if langs_out and not langs_out.startswith("ERR:") else None
+
+    return {
+        "tesseract": tesseract_ok,
+        "tesseract_version": tess_ver,
+        "tesseract_langs": langs,
+        "poppler": poppler_ok,
+        "libreoffice": soffice_ok,
+        "hwp5txt": hwp5txt_ok,
+    }
+
+
 @router.post(
     "/upload",
-    summary="폴더에 파일 업로드",
+    summary="폴더/노트에 파일 업로드 (note_id 있으면 노트 본문에도 삽입)",
     status_code=status.HTTP_201_CREATED
 )
 async def upload_file(
     folder_id: Optional[int] = Form(None),
+    note_id: Optional[int] = Form(None),
     upload_file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
@@ -82,6 +127,7 @@ async def upload_file(
 
     user_dir = os.path.join(BASE_UPLOAD_DIR, str(current_user.u_id))
     os.makedirs(user_dir, exist_ok=True)
+
 
     saved_filename = orig_filename
     saved_path = os.path.join(user_dir, saved_filename)
@@ -97,6 +143,9 @@ async def upload_file(
                 break
             counter += 1
 
+
+    # 저장
+
     try:
         with open(saved_path, "wb") as buffer:
             content = await upload_file.read()
@@ -104,9 +153,24 @@ async def upload_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"파일 저장 실패: {e}")
 
+
+    # note_id가 있으면 해당 노트 확인
+    note_obj = None
+    if note_id is not None:
+        note_obj = (
+            db.query(NoteModel)
+            .filter(NoteModel.id == note_id, NoteModel.user_id == current_user.u_id)
+            .first()
+        )
+        if not note_obj:
+            raise HTTPException(status_code=404, detail="해당 노트를 찾을 수 없습니다.")
+
+    # DB 메타 기록
+
     new_file = FileModel(
         user_id=current_user.u_id,
-        folder_id=folder_id,
+        folder_id=None if note_id else folder_id,
+        note_id=note_id,
         original_name=orig_filename,
         saved_path=saved_path,
         content_type=content_type
@@ -118,11 +182,25 @@ async def upload_file(
     base_url = os.getenv("BASE_API_URL", "http://localhost:8000")
     download_url = f"{base_url}/api/v1/files/download/{new_file.id}"
 
+    # note_id가 있으면 노트 본문에 첨부 링크 삽입
+    if note_obj:
+        if content_type.startswith("image/"):
+            embed = f"\n\n![{new_file.original_name}]({download_url})\n\n"
+        elif content_type == "application/pdf":
+            embed = f"\n\n[{new_file.original_name}]({download_url}) (PDF 보기)\n\n"
+        else:
+            embed = f"\n\n[{new_file.original_name}]({download_url})\n\n"
+
+        note_obj.content = (note_obj.content or "") + embed
+        db.commit()
+        db.refresh(note_obj)
+
     return {
         "file_id": new_file.id,
         "url": download_url,
         "original_name": new_file.original_name,
         "folder_id": new_file.folder_id,
+        "note_id": new_file.note_id,
         "content_type": new_file.content_type,
         "created_at": new_file.created_at
     }
@@ -180,21 +258,56 @@ def download_file(
     return FileResponse(
         path=file_path,
         media_type=file_obj.content_type,
-        headers={"Content-Disposition": content_disposition}
+        filename=file_obj.original_name,
+        background=None
     )
+
+
+# ---------------------------
+# 언어코드 유연 처리 유틸
+# ---------------------------
+LANG_ALIAS = {
+    "ko": "kor", "kr": "kor", "korean": "kor",
+    "en": "eng", "english": "eng"
+}
+def normalize_langs(raw: str) -> str:
+    """
+    입력 예: 'koreng', 'kor,eng', 'ko+en', 'ko,en', 'korean+english'
+    출력 예: 'kor+eng'
+    """
+    if not raw:
+        return "kor+eng"
+    s = raw.strip().lower().replace(" ", "")
+    s = re.sub(r"[,_;]+", "+", s)
+    if "+" not in s:
+        s = s.replace("koreng", "kor+eng").replace("koen", "ko+en")
+    parts = [p for p in s.split("+") if p]
+    norm: list[str] = []
+    for p in parts:
+        norm.append(LANG_ALIAS.get(p, p))
+    # 중복 제거(순서 보존)
+    seen, out = set(), []
+    for p in norm:
+        if p not in seen:
+            seen.add(p); out.append(p)
+    return "+".join(out) if out else "kor+eng"
 
 
 @router.post(
     "/ocr",
-    summary="이미지 OCR → 텍스트 변환 후 노트 생성",
-    response_model=dict
+    summary="이미지/PDF/DOC/DOCX/HWP OCR → 텍스트 변환 후 노트 생성",
+    response_model=OCRResponse
 )
 async def ocr_and_create_note(
-    ocr_file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None, description="기본 업로드 필드명"),
+    ocr_file: Optional[UploadFile] = File(None, description="과거 호환 업로드 필드명"),
     folder_id: Optional[int] = Form(None),
+    langs: str = Query("kor+eng", description="Tesseract 언어코드(유연 입력 허용: koreng, ko+en 등)"),
+    max_pages: int = Query(50, ge=1, le=500, description="최대 처리 페이지 수(기본 50)"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+
     """
     • ocr_file: 이미지 파일(UploadFile)
     • 1) EasyOCR로 기본 텍스트 추출 (GPU 모드)
@@ -254,17 +367,86 @@ async def ocr_and_create_note(
             folder_id=folder_id,
             title="OCR 결과",
             content=ocr_text  # **원본 OCR 텍스트만 저장**
-        )
-        db.add(new_note)
-        db.commit()
-        db.refresh(new_note)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"노트 저장 실패: {e}")
 
-    return {
-        "note_id": new_note.id,
-        "text": ocr_text
-    }
+    # 422 방지: 파일 필드명 유연 처리
+    upload = file or ocr_file
+    if upload is None:
+        raise HTTPException(
+            status_code=400,
+            detail="업로드 파일이 필요합니다. 필드명은 'file' 또는 'ocr_file'을 사용하세요."
+        )
+
+    filename = upload.filename or "uploaded"
+    mime = upload.content_type
+
+    # 확장자 검사
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    if ext and ext not in ALLOWED_ALL_EXTS:
+        return OCRResponse(
+            filename=filename,
+            mime=mime,
+            page_count=0,
+            results=[],
+            warnings=[f"허용되지 않는 확장자({ext}). 허용: {sorted(ALLOWED_ALL_EXTS)}"],
+            note_id=None,
+            text=None,
+
+        )
+
+    # 타입 판별
+    ftype = detect_type(filename, mime)
+    if ftype == "unknown":
+        return OCRResponse(
+            filename=filename,
+            mime=mime,
+            page_count=0,
+            results=[],
+            warnings=["지원되지 않는 파일 형식입니다."],
+            note_id=None,
+            text=None,
+        )
+
+    data = await upload.read()
+
+    # 언어코드 정규화
+    langs = normalize_langs(langs)
+
+    # 멀티엔진 앙상블 OCR 파이프라인 실행
+    pipe = run_pipeline(
+        filename=filename,
+        mime=mime,
+        data=data,
+        langs=langs,
+        max_pages=max_pages,
+    )
+
+    # 페이지 텍스트 합치기
+    merged_text = "\n\n".join([
+        item.get("text", "") for item in (pipe.get("results") or []) if item.get("text")
+    ]).strip()
+
+    note_id: Optional[int] = None
+    if merged_text:
+        try:
+            base_title = os.path.splitext(filename)[0].strip() or "OCR 결과"
+            new_note = NoteModel(
+                user_id=current_user.u_id,
+                folder_id=folder_id,
+                title=base_title,
+                content=merged_text,
+            )
+            db.add(new_note)
+            db.commit()
+            db.refresh(new_note)
+            note_id = new_note.id
+        except Exception as e:
+            (pipe.setdefault("warnings", [])).append(f"노트 저장 실패: {e}")
+
+    pipe["note_id"] = note_id
+    pipe["text"] = merged_text or None
+
+    return pipe
 
 
 @router.post("/audio")
@@ -275,24 +457,21 @@ async def upload_audio_and_transcribe(
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-    # 📁 저장 경로 생성
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"user{user.u_id}_{timestamp}_{file.filename}"
     save_dir = os.path.join(BASE_UPLOAD_DIR, str(user.u_id))
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, filename)
 
-    # 📥 파일 저장
     with open(save_path, "wb") as f:
         f.write(await file.read())
 
-    # ✅ note_id가 있으면 folder_id는 무시
     folder_id_to_use = folder_id if note_id is None else None
 
-    # 📦 files 테이블에 기록
     new_file = FileModel(
         user_id=user.u_id,
         folder_id=folder_id_to_use,
+        note_id=note_id,
         original_name=filename,
         saved_path=save_path,
         content_type="audio"
@@ -301,7 +480,6 @@ async def upload_audio_and_transcribe(
     db.commit()
     db.refresh(new_file)
 
-    # 🧠 STT 처리
     try:
         import whisper
         model = whisper.load_model("base")
@@ -310,9 +488,7 @@ async def upload_audio_and_transcribe(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT 처리 실패: {e}")
 
-    # 📝 노트 처리
     if note_id:
-        # 기존 노트에 텍스트 추가
         note = db.query(NoteModel).filter(
             NoteModel.id == note_id,
             NoteModel.user_id == user.u_id
@@ -327,7 +503,6 @@ async def upload_audio_and_transcribe(
         db.refresh(note)
 
     else:
-        # 새 노트 생성
         new_note = NoteModel(
             user_id=user.u_id,
             folder_id=folder_id_to_use,
@@ -342,3 +517,8 @@ async def upload_audio_and_transcribe(
         "message": "STT 및 노트 저장 완료",
         "transcript": transcript
     }
+
+
+@router.options("/ocr")
+def ocr_cors_preflight() -> Response:
+    return Response(status_code=200)

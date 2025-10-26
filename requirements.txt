@@ -3,16 +3,16 @@ uvicorn
 pydantic
 sqlalchemy
 mysql-connector-python
-dotenv
+python-dotenv
 google-auth
 requests
 python-jose[cryptography]
 bcrypt
 
-torch==2.3.0+cu121
-torchaudio==2.3.0+cu121
-torchvision==0.18.0+cu121
---extra-index-url https://download.pytorch.org/whl/cu121
+# PyTorch (MacOS: CPU/MPS 빌드 자동 설치됨)
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
 
 transformers>=4.40.0
 accelerate
@@ -20,3 +20,15 @@ sentencepiece
 protobuf
 python-multipart
 easyocr
+whisper
+pytesseract
+pdf2image
+PyMuPDF
+python-docx
+
+langchain>=0.2.0
+langchain-community
+langchain-core
+langchain-openai
+langchain-ollama
+bitsandbytes

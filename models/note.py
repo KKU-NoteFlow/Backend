@@ -14,10 +14,17 @@ class Note(Base):
     last_accessed = Column(TIMESTAMP, nullable=True)
     created_at    = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at    = Column(TIMESTAMP, nullable=False,
+
+                           server_default=text('CURRENT_TIMESTAMP'),
+                           onupdate=text('CURRENT_TIMESTAMP'))
+
+    # ✅ 관계
+
                            server_default=text("CURRENT_TIMESTAMP"),
                            onupdate=text("CURRENT_TIMESTAMP"))
 
     # relations
+
     user   = relationship("User", back_populates="notes")
     folder = relationship("Folder", back_populates="notes")
     files  = relationship("File", back_populates="note", cascade="all, delete")

@@ -11,6 +11,16 @@ class Folder(Base):
     parent_id  = Column(Integer, ForeignKey("folder.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(TIMESTAMP, nullable=False,
+
+                        server_default=text('CURRENT_TIMESTAMP'),
+                        onupdate=text('CURRENT_TIMESTAMP'))
+
+    # ✅ 관계
+    user     = relationship("User", back_populates="folders")
+    parent   = relationship("Folder", remote_side=[id], backref="children")
+    notes    = relationship("Note", back_populates="folder", cascade="all, delete")
+    files    = relationship("File", back_populates="folder", cascade="all, delete")
+
                         server_default=text("CURRENT_TIMESTAMP"),
                         onupdate=text("CURRENT_TIMESTAMP"))
 
@@ -18,3 +28,4 @@ class Folder(Base):
     user     = relationship("User")
     parent   = relationship("Folder", remote_side=[id], backref="children")
     notes    = relationship("Note", back_populates="folder", cascade="all, delete")
+

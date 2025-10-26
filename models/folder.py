@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, TIMESTAMP, text
+from sqlalchemy.orm import relationship
 from .base import Base
 
 class Folder(Base):
@@ -12,3 +13,9 @@ class Folder(Base):
     updated_at = Column(TIMESTAMP, nullable=False,
                         server_default=text('CURRENT_TIMESTAMP'),
                         onupdate=text('CURRENT_TIMESTAMP'))
+
+    # ✅ 관계
+    user     = relationship("User", back_populates="folders")
+    parent   = relationship("Folder", remote_side=[id], backref="children")
+    notes    = relationship("Note", back_populates="folder", cascade="all, delete")
+    files    = relationship("File", back_populates="folder", cascade="all, delete")

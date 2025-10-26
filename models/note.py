@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, Text, Boolean, ForeignKey, TIMESTAMP, text
+from sqlalchemy.orm import relationship
 from .base import Base
 
 class Note(Base):
@@ -15,3 +16,8 @@ class Note(Base):
     updated_at    = Column(TIMESTAMP, nullable=False,
                            server_default=text('CURRENT_TIMESTAMP'),
                            onupdate=text('CURRENT_TIMESTAMP'))
+
+    # ✅ 관계
+    user   = relationship("User", back_populates="notes")
+    folder = relationship("Folder", back_populates="notes")
+    files  = relationship("File", back_populates="note", cascade="all, delete")

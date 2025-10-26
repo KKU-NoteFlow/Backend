@@ -1,6 +1,8 @@
 # src/main.py
 import os
 from dotenv import load_dotenv
+# 환경 변수를 최대한 빨리 로드하여 GPU 설정(CUDA_VISIBLE_DEVICES)이 라우터 임포트 전에 적용되도록 함
+load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers.auth import router as auth_router
@@ -11,8 +13,7 @@ from routers.file import router as file_router
 import logging
 import uvicorn  
 
-# 1) 환경변수 로드
-load_dotenv()
+# 1) 환경변수 로드 (상단에서 선 로드됨)
 
 # 2) 로깅 설정
 logging.basicConfig(level=logging.INFO)

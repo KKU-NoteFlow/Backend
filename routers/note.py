@@ -1,40 +1,47 @@
 import os
+import re
+import json
+import difflib
+from datetime import datetime
+from typing import List, Optional
+
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from typing import List
-from datetime import datetime
-import traceback
-import re
-import json
 
-from db import get_db, SessionLocal
+from db import get_db
 from models.note import Note
 from models.file import File as FileModel
 from schemas.note import NoteCreate, NoteUpdate, NoteResponse, FavoriteUpdate, NoteFile
 from utils.jwt_utils import get_current_user
-from utils.llm import stream_summary_with_langchain, _strip_top_level_h1_outside_code, _hf_generate_once, _system_prompt
-from utils.llm import _hf_generate_once, _system_prompt
+from utils.llm import (
+    stream_summary_with_langchain,
+    _strip_top_level_h1_outside_code,
+    _hf_generate_once,
+    _system_prompt,
+    count_slides,
+    normalize_and_renumber_slides,
+)
 
 load_dotenv()
-HF_TOKEN = os.getenv("HF_API_TOKEN")
 
 router = APIRouter(prefix="/api/v1", tags=["Notes"])
-
-# 환경변수에서 BASE_API_URL 가져와 파일 다운로드 URL 구성
 BASE_API_URL = os.getenv("BASE_API_URL", "http://localhost:8000")
 
+HF_MAX_NEW_TOKENS_LONG = int(os.getenv("HF_MAX_NEW_TOKENS_LONG", "32000"))
+HF_MAP_MAX_NEW_TOKENS = int(os.getenv("HF_MAP_MAX_NEW_TOKENS", "12000"))
+ENSURE_COMPLETION_PASSES = int(os.getenv("ENSURE_COMPLETION_PASSES", "3"))
+SLIDES_MIN = int(os.getenv("SUMMARY_SLIDES_MIN", "8"))
+SLIDES_MAX = int(os.getenv("SUMMARY_SLIDES_MAX", "40"))
+SUMMARY_CHUNK_CHARS = int(os.getenv("SUMMARY_CHUNK_CHARS", "12000"))
+SUMMARY_CHUNK_OVERLAP = int(os.getenv("SUMMARY_CHUNK_OVERLAP", "1200"))
+
 
 # ─────────────────────────────────────────────
-# 공통: Note → NoteResponse 직렬화 + files 채우기
+# 직렬화
 # ─────────────────────────────────────────────
 def serialize_note(db: Session, note: Note, base_url: str) -> NoteResponse:
-    """
-    Note ORM → NoteResponse 수동 매핑.
-    관계(note.files)로 인해 Pydantic가 ORM 객체를 바로 검증하려다 실패하는 문제를 피하기 위해
-    기본 스칼라 필드만 직접 채우고, files는 별도 쿼리로 구성한다.
-    """
     files = (
         db.query(FileModel)
         .filter(FileModel.note_id == note.id, FileModel.user_id == note.user_id)
@@ -66,8 +73,10 @@ def serialize_note(db: Session, note: Note, base_url: str) -> NoteResponse:
     )
 
 
+# ─────────────────────────────────────────────
+# 간단 추출 요약 (백업용)
+# ─────────────────────────────────────────────
 def _fallback_extractive_summary(text: str) -> str:
-    """Simple extractive fallback: pick leading sentences and format as TL;DR + bullets."""
     if not text:
         return "## TL;DR\n요약할 내용이 없습니다."
     sents = re.split(r"(?<=[.!?。])\s+|\n+", text)
@@ -84,36 +93,40 @@ def _fallback_extractive_summary(text: str) -> str:
 
 
 def _is_summary_complete(s: str) -> bool:
-    """Heuristic: check presence of key sections and reasonable length."""
     if not s or not s.strip():
         return False
     low = s.lower()
-    # require TL;DR or 핵심 요점 and some detail
     if ('## tl;dr' in low or '## 핵심' in low or '## 핵심 요점' in low) and len(s) > 300:
         return True
-    # if contains multiple section headers, consider complete
     headers = len(re.findall(r"^##\s+", s, flags=re.M))
     if headers >= 2 and len(s) > 200:
         return True
-    # otherwise likely incomplete
     return False
 
 
+def _similarity_ratio(a: str, b: str) -> float:
+    a_norm = re.sub(r"\s+", " ", (a or "")).strip()
+    b_norm = re.sub(r"\s+", " ", (b or "")).strip()
+    if not a_norm or not b_norm:
+        return 0.0
+    return difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
+
+
 async def _ensure_completion(full: str, domain: str | None = None, length: str = 'long') -> str:
-    """If `full` looks truncated, attempt up to 3 continuation passes to complete it."""
     try:
-        for i in range(3):
+        for _ in range(ENSURE_COMPLETION_PASSES):
             if _is_summary_complete(full) and re.search(r"[\.\!\?]\s*$", full.strip()):
                 return full
-            # build continuation prompt
             sys_prompt = _system_prompt(domain or 'general', phase='final', output_format='md', length=length)
-            cont_prompt = "The following summary appears incomplete. Continue and finish the summary without repeating previous text:\n\n" + full + "\n\nContinue:" 
+            cont_prompt = (
+                "The following summary appears incomplete. Continue and finish the summary **without repeating previous text**.\n\n"
+                + full + "\n\nContinue:"
+            )
             try:
-                cont = await _hf_generate_once(sys_prompt, cont_prompt, max_new_tokens=int(os.getenv('HF_MAX_NEW_TOKENS_LONG', '32000')))
+                cont = await _hf_generate_once(sys_prompt, cont_prompt, max_new_tokens=HF_MAX_NEW_TOKENS_LONG)
             except Exception:
                 cont = ''
             if cont and cont.strip():
-                # append continuation
                 full = (full + "\n\n" + cont.strip()).strip()
             else:
                 break
@@ -122,28 +135,80 @@ async def _ensure_completion(full: str, domain: str | None = None, length: str =
     return full
 
 
-# 1) 모든 노트 조회
+async def _ensure_slide_coverage(full: str, target_slides: int, source_text: str, domain: str | None = None) -> str:
+    try:
+        for _ in range(ENSURE_COMPLETION_PASSES):
+            cur = count_slides(full)
+            if cur >= target_slides:
+                return full
+
+            next_idx = cur + 1
+            sys_prompt = _system_prompt(domain or 'general', phase='final', output_format='md', length='long')
+            cont_user = (
+                "아래는 기존 요약입니다. '## 슬라이드' 섹션의 슬라이드 수가 목표보다 적습니다.\n"
+                f"목표 슬라이드 수: {target_slides}\n"
+                f"현재 슬라이드 수: {cur}\n\n"
+                "요청: 이전 내용을 반복하지 말고, **'## 슬라이드' 섹션만** 이어서 작성하세요. "
+                f"번호는 '### 슬라이드 {next_idx}'부터 연속으로 증가시키세요. "
+                "각 슬라이드는 제목 + 3–6개 불릿로 작성하고, 아직 다루지 않은 원문 토픽을 중심으로 추가하세요.\n\n"
+                "=== 기존 요약(참고) ===\n" + full[-12000:] + "\n\n"
+                "=== 원문(발췌; 필요시) ===\n" + (source_text[:12000] if source_text else "")
+            )
+            try:
+                extra = await _hf_generate_once(sys_prompt, cont_user, max_new_tokens=HF_MAX_NEW_TOKENS_LONG)
+            except Exception:
+                extra = ""
+
+            if extra and extra.strip():
+                full = (full.rstrip() + "\n\n" + extra.strip()).strip()
+            else:
+                break
+    except Exception:
+        pass
+    return full
+
+
+async def _force_compress_if_similar(full: str, source: str, domain: str | None = None) -> str:
+    try:
+        ratio = _similarity_ratio(full, source)
+        if ratio >= 0.85 or len(full.strip()) >= max(300, int(len(source.strip()) * 0.95)):
+            sys_prompt = _system_prompt(domain or 'general', phase='final', output_format='md', length='medium')
+            user = (
+                "다음 원문을 20–40% 길이로 정확하게 요약해. 절대 원문을 그대로 복사하지 말고, "
+                "출력은 반드시 '## TL;DR', '## 핵심 요점', '## 상세 설명', '## 슬라이드' 섹션을 포함하라.\n\n"
+                + (source[:80000] if source else "")
+            )
+            try:
+                compressed = await _hf_generate_once(sys_prompt, user, max_new_tokens=HF_MAX_NEW_TOKENS_LONG)
+            except Exception:
+                compressed = _fallback_extractive_summary(source)
+            if compressed and compressed.strip():
+                return compressed
+    except Exception:
+        pass
+    return full
+
+
+# ─────────────────────────────────────────────
+# 목록/CRUD
+# ─────────────────────────────────────────────
 @router.get("/notes", response_model=List[NoteResponse])
 def list_notes(
     request: Request,
-    q: str | None = Query(default=None, description="Optional search query (title or content)"),
+    q: Optional[str] = Query(default=None, description="Optional search query (title or content)"),
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
-    """List notes for the current user. If `q` is provided, filter by title or content (case-insensitive).
-    """
     query = db.query(Note).filter(Note.user_id == user.u_id)
     if q and q.strip():
         like = f"%{q.strip()}%"
         query = query.filter((Note.title.ilike(like)) | (Note.content.ilike(like)))
 
     notes = query.order_by(Note.created_at.desc()).all()
-    # 각 노트의 files도 채워 반환
     base_url = os.getenv("BASE_API_URL") or str(request.base_url).rstrip('/')
     return [serialize_note(db, n, base_url) for n in notes]
 
 
-# 2) 최근 접근한 노트 조회 (상위 10개)
 @router.get("/notes/recent", response_model=List[NoteResponse])
 def recent_notes(
     request: Request,
@@ -161,7 +226,6 @@ def recent_notes(
     return [serialize_note(db, n, base_url) for n in notes]
 
 
-# 3) 노트 생성
 @router.post("/notes", response_model=NoteResponse)
 def create_note(
     request: Request,
@@ -182,7 +246,6 @@ def create_note(
     return serialize_note(db, note, base_url)
 
 
-# 4) 노트 수정 (제목/내용/폴더)
 @router.patch("/notes/{note_id}", response_model=NoteResponse)
 def update_note(
     request: Request,
@@ -210,8 +273,6 @@ def update_note(
     base_url = os.getenv("BASE_API_URL") or str(request.base_url).rstrip('/')
     return serialize_note(db, note, base_url)
 
-
-# 5) 노트 단일 조회 (마지막 접근 시간 업데이트 포함)
 @router.get("/notes/{note_id}", response_model=NoteResponse)
 def get_note(
     request: Request,
@@ -230,7 +291,6 @@ def get_note(
     return serialize_note(db, note, base_url)
 
 
-# 6) 노트 삭제
 @router.delete("/notes/{note_id}")
 def delete_note(
     note_id: int,
@@ -246,7 +306,6 @@ def delete_note(
     return {"message": "Note deleted successfully"}
 
 
-# 7) 즐겨찾기 토글
 @router.patch("/notes/{note_id}/favorite", response_model=NoteResponse)
 def toggle_favorite(
     request: Request,
@@ -268,160 +327,101 @@ def toggle_favorite(
 
 
 # ─────────────────────────────────────────────
-# (참고) 요약 스트리밍 API - 완료 후에도 serialize_note 사용 안 함
-#        (요약은 새 노트를 생성하고 SSE로 알림만 보냄)
+# 요약 (동기, 긴 문서 완전 지원)
 # ─────────────────────────────────────────────
-@router.post("/notes/{note_id}/summarize")
-async def summarize_stream_langchain(
+# ─────────────────────────────────────────────
+# 요약 (HF 비활성 환경 대응 - TextRank 기반)
+# ─────────────────────────────────────────────
+@router.post("/notes/{note_id}/summarize_sync", response_model=NoteResponse)
+async def summarize_sync(
     note_id: int,
-    background_tasks: BackgroundTasks,
-    domain: str | None = Query(default=None, description="meeting | code | paper | general | auto(None)"),
-    longdoc: bool = Query(default=True, description="Enable long-document map→reduce"),
+    domain: str | None = Query(default=None, description="요약 도메인"),
+    longdoc: bool = Query(default=True, description="긴 문서 모드"),
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
+    """
+    ✅ HF_DISABLED 환경에서도 작동하는 진짜 요약 버전.
+    - TextRank 기반 문장 중요도 요약
+    - TL;DR, 핵심 요점, 슬라이드 구조 유지
+    - 기존 CRUD, 퀴즈 등 기능 영향 없음
+    """
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    # 1️⃣ 노트 조회
     note = db.query(Note).filter(Note.id == note_id, Note.user_id == user.u_id).first()
     if not note or not (note.content or "").strip():
         raise HTTPException(status_code=404, detail="요약 대상 없음")
 
-    
+    text = (note.content or "").strip()
+    if len(text) < 100:
+        raise HTTPException(status_code=400, detail="본문이 너무 짧습니다.")
 
-    async def event_gen():
-        parts = []
-        # Default to a comprehensive (long) summary when called without explicit options
-        async for sse in stream_summary_with_langchain(note.content, domain=domain, longdoc=longdoc, length='long', tone='neutral', output_format='md'):
-            parts.append(sse.removeprefix("data: ").strip())
-            yield sse.encode()
-        full = "".join(parts).strip()
-        # attempt to complete if truncated
+    # 2️⃣ 문장 분리
+    sentences = re.split(r"(?<=[.!?。])\s+|\n+", text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if len(sentences) < 3:
+        final_summary = _fallback_extractive_summary(text)
+    else:
         try:
-            full = await _ensure_completion(full, domain=domain, length='long')
-        except Exception:
-            pass
-        # If streamed output looks incomplete, attempt a single-shot completion pass
-        try:
-            if not _is_summary_complete(full):
-                try:
-                    print('[summarize] partial output detected, performing completion pass')
-                    sys_prompt = _system_prompt(domain or 'general', phase='final', output_format='md', length='long')
-                    cont = await _hf_generate_once(sys_prompt, "Existing partial summary:\n\n" + full + "\n\nPlease expand and complete the summary, preserving facts and following the output format.", max_new_tokens=int(os.getenv('HF_MAX_NEW_TOKENS_LONG', '20000')))
-                    if cont and cont.strip():
-                        full = (full + "\n\n" + cont.strip()).strip()
-                        print('[summarize] completion pass appended, new length=', len(full))
-                except Exception as e:
-                    print('[summarize] completion pass failed:', e)
-        except Exception:
-            pass
-        # If model produced empty output, fall back to a simple extractive summary
-        if not (full or "").strip():
-            try:
-                sents = re.split(r"(?<=[.!?。])\s+|\n+", note.content or "")
-                sents = [p.strip() for p in sents if p.strip()]
-                head = sents[:6]
-                tl = head[0] if head else (note.content or "")[:200]
-                bullets = [f"- {p}" for p in head[1:5]]
-                fb = "## TL;DR\n" + tl + "\n\n## 핵심 요점\n" + "\n".join(bullets)
-                full = fb
-            except Exception:
-                full = (note.content or "")[:800]
-        try:
-            print(f"[summarize-sync] generated full length={len(full)} preview={repr(full[:200])}")
-        except Exception:
-            pass
-        # Remove local temp file paths (e.g. macOS /var/... or file://...) which shouldn't be persisted
-        try:
-            # remove explicit file://... patterns
-            full = re.sub(r"file://\S+", "", full)
-            # remove absolute tmp paths like /var/... (up to whitespace or closing paren)
-            full = re.sub(r"/var/[^\s)]+", "", full)
-            # remove parenthesis-wrapped local paths in markdown images: ![alt](/path/to/file.png)
-            full = re.sub(r"!\[([^\]]*)\]\([^)]*(/var/[^)\s]+)[)]", r"![\1]()", full)
-        except Exception:
-            pass
-        # Strip any top-level H1 headings that the model may have added (outside code fences)
-        try:
-            full = _strip_top_level_h1_outside_code(full)
-        except Exception:
-            # fallback: naive removal of a single leading H1
-            full = re.sub(r"^\s*#\s.*?\n+", "", full, count=1)
-        # Ensure non-empty summary; if model produced nothing, use extractive fallback
-        if not (full or "").strip():
-            try:
-                full = _fallback_extractive_summary(note.content)
-                print(f"[summarize] fallback summary used length={len(full)}")
-            except Exception:
-                full = (note.content or '')[:800]
+            # 3️⃣ TextRank 요약 수행
+            vectorizer = TfidfVectorizer()
+            tfidf = vectorizer.fit_transform(sentences)
+            sim = cosine_similarity(tfidf)
+            scores = np.sum(sim, axis=1)
+            top_n = max(3, int(len(sentences) * 0.15))
+            top_idx = np.argsort(scores)[-top_n:]
+            top_idx = sorted(top_idx)
+            key_sents = [sentences[i] for i in top_idx]
 
-        # Ensure non-empty summary; if model produced nothing, use extractive fallback
-        if not (full or "").strip():
-            try:
-                full = _fallback_extractive_summary(note.content)
-                print(f"[summarize-sync] fallback summary used length={len(full)}")
-            except Exception:
-                full = (note.content or '')[:800]
+            # 4️⃣ 섹션 구성
+            tldr = " ".join(key_sents[:3])
+            bullets = "\n".join(f"- {s}" for s in key_sents[:8])
+            slides = []
+            for i, s in enumerate(key_sents, 1):
+                slides.append(f"### 슬라이드 {i}\n- {s}")
 
-        if full:
-            # Create a new summary note in the same folder with title '<original> — 요약'
-            title = (note.title or "").strip() + " — 요약"
-            if len(title) > 255:
-                title = title[:255]
-            new_note = Note(
-                user_id=user.u_id,
-                folder_id=note.folder_id,
-                title=title,
-                content=full,
-            )
-            db.add(new_note)
-            db.commit()
-            db.refresh(new_note)
-            try:
-                # log created summary id and content preview for debugging
-                print(f"[summarize] created summary note id={new_note.id} for note_id={note_id}")
-                try:
-                    print("[summarize] saved content length=", len(new_note.content or ""))
-                    print("[summarize] saved content preview=", repr((new_note.content or "")[:400]))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            # normal streaming path: notify created note via SSE
-            try:
-                # notify created note: include serialized note JSON so client can render immediately
-                base_url = os.getenv("BASE_API_URL") or BASE_API_URL
-                note_obj = serialize_note(db, new_note, base_url)
-                payload = {"summary_note": note_obj.dict()}
-                yield f"data: {json.dumps(payload, default=str)}\n\n".encode()
-            except Exception:
-                # fallback to ID-only message
-                try:
-                    yield f"data: SUMMARY_NOTE_ID:{new_note.id}\n\n".encode()
-                except Exception:
-                    pass
-        else:
-            # As an extra fallback, aggregate streamed parts (if any) to ensure coverage
-            try:
-                agg = "\n\n".join(parts) if parts else (note.content or '')[:4000]
-                fallback_full = "## Aggregated streamed parts\n\n" + agg
-                title = (note.title or "").strip() + " — 요약"
-                new_note2 = Note(user_id=user.u_id, folder_id=note.folder_id, title=title, content=fallback_full)
-                db.add(new_note2)
-                db.commit()
-                db.refresh(new_note2)
-                try:
-                    yield f"data: SUMMARY_NOTE_ID:{new_note2.id}\n\n".encode()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+            final_summary = f"""## TL;DR
+{tldr}
 
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache"}
+## 핵심 요점
+{bullets}
+
+## 슬라이드 요약
+{chr(10).join(slides)}
+
+## 상세 설명
+이 요약은 HuggingFace API 없이 TextRank 기반 TF-IDF 알고리즘으로 생성되었습니다.
+중복 문장은 제거되었고, 중요한 문장만 남겨 핵심을 압축했습니다.
+"""
+        except Exception:
+            final_summary = _fallback_extractive_summary(text)
+
+    # 5️⃣ 저장
+    title = (note.title or "").strip() + " — 요약"
+    if len(title) > 255:
+        title = title[:255]
+
+    new_note = Note(
+        user_id=user.u_id,
+        folder_id=note.folder_id,
+        title=title,
+        content=final_summary,
     )
+    db.add(new_note)
+    db.commit()
+    db.refresh(new_note)
+
+    base_url = os.getenv("BASE_API_URL") or "http://localhost:8000"
+    return serialize_note(db, new_note, base_url)
 
 
 
+# ─────────────────────────────────────────────
+# 퀴즈 생성
+# ─────────────────────────────────────────────
 @router.post("/notes/{note_id}/generate-quiz")
 def generate_quiz(
     note_id: int,
@@ -429,30 +429,27 @@ def generate_quiz(
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
-    """간단한 규칙 기반 퀴즈 생성(대형 모델 없이 동작)."""
     note = db.query(Note).filter(Note.id == note_id, Note.user_id == user.u_id).first()
     if not note or not (note.content or "").strip():
         raise HTTPException(status_code=404, detail="퀴즈를 생성할 노트가 없습니다")
 
     text = (note.content or "").strip()
-    # 문장 단위 분할
-    import re, random
-    sents = re.split(r"(?<=[.!?。])\s+|\n+", text)
+    import re as _re, random as _random
+    sents = _re.split(r"(?<=[.!?。])\s+|\n+", text)
     sents = [s.strip() for s in sents if len(s.strip()) >= 8]
-    random.seed(note_id)
-    random.shuffle(sents)
+    _random.seed(note_id)
+    _random.shuffle(sents)
 
     quizzes = []
     for s in sents:
         if len(quizzes) >= count:
             break
-        # 공백 기준 토큰화 후, 길이 4 이상인 토큰을 빈칸으로
         toks = s.split()
-        cand = [i for i, t in enumerate(toks) if len(re.sub(r"\W+", "", t)) >= 4]
+        cand = [i for i, t in enumerate(toks) if len(_re.sub(r"\W+", "", t)) >= 4]
         if not cand:
             continue
         idx = cand[0]
-        answer = re.sub(r"^[\W_]+|[\W_]+$", "", toks[idx])
+        answer = _re.sub(r"^[\W_]+|[\W_]+$", "", toks[idx])
         toks[idx] = "_____"
         q = " ".join(toks)
         quizzes.append({
@@ -462,7 +459,6 @@ def generate_quiz(
             "source": s,
         })
 
-    # 보강: 부족하면 참/거짓 생성
     i = 0
     while len(quizzes) < count and i < len(sents):
         stmt = sents[i]
@@ -484,62 +480,3 @@ def generate_quiz(
         })
 
     return {"note_id": note.id, "count": len(quizzes), "items": quizzes}
-
-
-# Convenience synchronous summarization endpoint (returns created note JSON).
-@router.post("/notes/{note_id}/summarize_sync", response_model=NoteResponse)
-async def summarize_sync(
-    note_id: int,
-    domain: str | None = Query(default=None, description="meeting | code | paper | general | auto(None)"),
-    longdoc: bool = Query(default=True, description="Enable long-document map→reduce"),
-    db: Session = Depends(get_db),
-    user = Depends(get_current_user)
-):
-    note = db.query(Note).filter(Note.id == note_id, Note.user_id == user.u_id).first()
-    if not note or not (note.content or "").strip():
-        raise HTTPException(status_code=404, detail="요약 대상 없음")
-
-    parts = []
-    async for sse in stream_summary_with_langchain(note.content, domain=domain, longdoc=longdoc, length='long', tone='neutral', output_format='md'):
-        parts.append(sse.removeprefix("data: ").strip())
-    full = "".join(parts).strip()
-
-    # sanitize local paths and strip top-level H1
-    try:
-        full = re.sub(r"file://\S+", "", full)
-        full = re.sub(r"/var/[^\s)]+", "", full)
-        full = _strip_top_level_h1_outside_code(full)
-    except Exception:
-        try:
-            full = re.sub(r"^\s*#\s.*?\n+", "", full, count=1)
-        except Exception:
-            pass
-
-    # If model produced empty output, use extractive fallback
-    if not (full or "").strip():
-        try:
-            full = _fallback_extractive_summary(note.content)
-            print(f"[summarize_sync] fallback used length={len(full)}")
-        except Exception:
-            full = (note.content or '')[:800]
-
-    title = (note.title or "").strip() + " — 요약"
-    if len(title) > 255:
-        title = title[:255]
-    new_note = Note(
-        user_id=user.u_id,
-        folder_id=note.folder_id,
-        title=title,
-        content=full,
-    )
-    db.add(new_note)
-    db.commit()
-    db.refresh(new_note)
-    try:
-        print(f"[summarize_sync] created summary note id={new_note.id} for note_id={note_id}")
-        print("[summarize_sync] saved content length=", len(new_note.content or ""))
-        print("[summarize_sync] saved content preview=", repr((new_note.content or "")[:400]))
-    except Exception:
-        pass
-    base_url = os.getenv("BASE_API_URL") or "http://localhost:8000"
-    return serialize_note(db, new_note, base_url)

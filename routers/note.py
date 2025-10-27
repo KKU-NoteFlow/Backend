@@ -325,81 +325,123 @@ def toggle_favorite(
     base_url = os.getenv("BASE_API_URL") or str(request.base_url).rstrip('/')
     return serialize_note(db, note, base_url)
 
-
 # ─────────────────────────────────────────────
-# 요약 (동기, 긴 문서 완전 지원)
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# 요약 (HF 비활성 환경 대응 - TextRank 기반)
+# 요약 (로컬 Qwen 모델 기반, ChatGPT 스타일 자연요약)
 # ─────────────────────────────────────────────
 @router.post("/notes/{note_id}/summarize_sync", response_model=NoteResponse)
 async def summarize_sync(
     note_id: int,
-    domain: str | None = Query(default=None, description="요약 도메인"),
-    longdoc: bool = Query(default=True, description="긴 문서 모드"),
     db: Session = Depends(get_db),
-    user = Depends(get_current_user)
+    user=Depends(get_current_user)
 ):
     """
-    ✅ HF_DISABLED 환경에서도 작동하는 진짜 요약 버전.
-    - TextRank 기반 문장 중요도 요약
-    - TL;DR, 핵심 요점, 슬라이드 구조 유지
-    - 기존 CRUD, 퀴즈 등 기능 영향 없음
+    ✅ ChatGPT 스타일 요약 + 요약 완료 후 메모리 해제
     """
+    import torch
     import numpy as np
+    import gc
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 
-    # 1️⃣ 노트 조회
     note = db.query(Note).filter(Note.id == note_id, Note.user_id == user.u_id).first()
     if not note or not (note.content or "").strip():
         raise HTTPException(status_code=404, detail="요약 대상 없음")
 
-    text = (note.content or "").strip()
-    if len(text) < 100:
+    source = note.content.strip()
+    if len(source) < 50:
         raise HTTPException(status_code=400, detail="본문이 너무 짧습니다.")
 
-    # 2️⃣ 문장 분리
-    sentences = re.split(r"(?<=[.!?。])\s+|\n+", text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-    if len(sentences) < 3:
-        final_summary = _fallback_extractive_summary(text)
-    else:
+    full_summary = ""
+    failed = False
+
+    try:
+        print("[summarize_sync] 🚀 Qwen2.5-7B-Instruct 로드 중...")
+        model_name = "Qwen/Qwen2.5-7B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "당신은 전문적인 과학기술 문서 요약가입니다. "
+                    "텍스트를 자연스럽고 명확하게 요약하세요. "
+                    "결과는 Markdown 형식으로 작성하고, 다음 구조를 유지하세요:\n\n"
+                    "## 요약\n\n"
+                    "## 핵심 요점\n\n"
+                    "## 상세 설명\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"아래 내용을 ChatGPT처럼 깔끔하고 자연스럽게 요약해줘:\n\n{source}",
+            },
+        ]
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        ).to(model.device)
+
+        print("[summarize_sync] 🧠 요약 생성 중...")
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=1500, temperature=0.4, top_p=0.9)
+        generated = tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
+        full_summary = generated.strip()
+
+        print("[summarize_sync] ✅ 요약 완료")
+
+    except Exception as e:
+        print(f"[summarize_sync] ❌ 모델 요약 실패: {e}")
+        failed = True
+
+    finally:
+        # ✅ 메모리 해제
         try:
-            # 3️⃣ TextRank 요약 수행
-            vectorizer = TfidfVectorizer()
-            tfidf = vectorizer.fit_transform(sentences)
-            sim = cosine_similarity(tfidf)
-            scores = np.sum(sim, axis=1)
-            top_n = max(3, int(len(sentences) * 0.15))
-            top_idx = np.argsort(scores)[-top_n:]
-            top_idx = sorted(top_idx)
-            key_sents = [sentences[i] for i in top_idx]
+            del model
+            del tokenizer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("[summarize_sync] 🧹 모델 메모리 해제 완료")
+        except Exception as e:
+            print(f"[summarize_sync] ⚠️ 메모리 해제 실패: {e}")
 
-            # 4️⃣ 섹션 구성
-            tldr = " ".join(key_sents[:3])
-            bullets = "\n".join(f"- {s}" for s in key_sents[:8])
-            slides = []
-            for i, s in enumerate(key_sents, 1):
-                slides.append(f"### 슬라이드 {i}\n- {s}")
-
-            final_summary = f"""## TL;DR
-{tldr}
-
-## 핵심 요점
-{bullets}
-
-## 슬라이드 요약
-{chr(10).join(slides)}
-
-## 상세 설명
-이 요약은 HuggingFace API 없이 TextRank 기반 TF-IDF 알고리즘으로 생성되었습니다.
-중복 문장은 제거되었고, 중요한 문장만 남겨 핵심을 압축했습니다.
-"""
+    # ───────────────
+    # Fallback (TextRank)
+    # ───────────────
+    if failed or not full_summary:
+        print("[summarize_sync] ⚠️ TextRank 백업 사용")
+        try:
+            sents = re.split(r"(?<=[.!?。])\s+|\n+", source)
+            sents = [s.strip() for s in sents if len(s.strip()) > 10]
+            if len(sents) < 3:
+                full_summary = _fallback_extractive_summary(source)
+            else:
+                vec = TfidfVectorizer()
+                tfidf = vec.fit_transform(sents)
+                sim = cosine_similarity(tfidf)
+                scores = np.sum(sim, axis=1)
+                top_n = max(3, int(len(sents) * 0.2))
+                top_idx = np.argsort(scores)[-top_n:]
+                key_sents = [sents[i] for i in sorted(top_idx)]
+                bullets = "\n".join(f"- {s}" for s in key_sents[:5])
+                full_summary = f"## 요약\n{' '.join(key_sents[:2])}\n\n## 핵심 요점\n{bullets}\n\n## 상세 설명\n이 요약은 TextRank 기반 로컬 요약입니다."
         except Exception:
-            final_summary = _fallback_extractive_summary(text)
+            full_summary = _fallback_extractive_summary(source)
 
-    # 5️⃣ 저장
+    # ───────────────
+    # DB 저장
+    # ───────────────
     title = (note.title or "").strip() + " — 요약"
     if len(title) > 255:
         title = title[:255]
@@ -408,7 +450,7 @@ async def summarize_sync(
         user_id=user.u_id,
         folder_id=note.folder_id,
         title=title,
-        content=final_summary,
+        content=full_summary,
     )
     db.add(new_note)
     db.commit()

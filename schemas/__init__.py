@@ -6,4 +6,10 @@ from .user import (
     GoogleLoginRequest, NaverLoginRequest,
     KakaoLoginRequest,
 )
+
+from .qg_schema import (
+    QuestionItem,
+    QuestionGenerationRequest,
+    QuestionGenerationResponse,
+)
  

@@ -13,6 +13,7 @@ from routers.note import router as note_router
 from routers.folder import router as folder_router
 from routers.checklist import router as checklist_router
 from routers.file import router as file_router
+from routers import qg_router
 
 
 # 1) 환경변수 로드 (상단에서 선 로드됨)
@@ -42,6 +43,7 @@ app.include_router(note_router)
 app.include_router(folder_router)
 app.include_router(file_router)
 app.include_router(checklist_router)
+app.include_router(qg_router.router)
 
 @app.get("/")
 def root():

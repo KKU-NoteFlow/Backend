@@ -1,0 +1,29 @@
+{
+    "answers": [
+        {
+            "id": 1,
+            "question_preview": "다음 중 인공지능(AI)의 정의로 가장 적절한 것은 무엇인가요?...",
+            "correct_answer": "인간의 지능적 행동을 기계가 수행할 수 있도록 하는 기술"
+        },
+        {
+            "id": 2,
+            "question_preview": "지도학습(Supervised Learning)에서 학습에 사용되는 데이터는 어떤 특징을 가...",
+            "correct_answer": "입력과 정답이 함께 주어진 데이터를 이용하여 학습"
+        },
+        {
+            "id": 3,
+            "question_preview": "강화학습(Reinforcement Learning)에서 학습하는 주요 목표는 무엇인가요?...",
+            "correct_answer": "환경과 상호작용하며 보상을 최대화하는 행동 학습"
+        },
+        {
+            "id": 4,
+            "question_preview": "딥러닝(DL)의 핵심 기술은 무엇인가요?...",
+            "correct_answer": "인공신경망을 여러 층으로 깊게 쌓아 복잡한 패턴을 학습하는 기술"
+        },
+        {
+            "id": 5,
+            "question_preview": "대규모 언어모델(LLM)은 어떤 특징을 가지고 있나요?...",
+            "correct_answer": "수십억 개 이상의 파라미터를 가진 언어모델로, 다양한 언어 태스크에서 활용"
+        }
+    ]
+}

@@ -42,20 +42,48 @@
 
 ```mermaid
 flowchart LR
+  %% 클라이언트
   client[Client]
-  api[FastAPI]
-  db[(MySQL)]
-  oauth_g[Google]
-  oauth_n[Naver]
-  oauth_k[Kakao]
-  svc[OCR & Whisper]
 
-  client --> api
-  api --> db
-  client -.-> oauth_g
-  client -.-> oauth_n
-  client -.-> oauth_k
-  api --> svc
+  %% 백엔드 서비스 그룹
+  subgraph FastAPI_Backend [NoteFlow Backend]
+    api[FastAPI Router]
+    auth[JWT / OAuth Handler]
+    
+    subgraph AI_Engine [AI Processing Service]
+      ocr[OCR Engine\nPDF/Img Text]
+      whisper[Whisper Engine\nAudio STT]
+      llm[LLM Engine\nSummary/Quiz]
+    end
+  end
+
+  %% 외부 및 데이터 저장소
+  db[(MySQL)]
+  fs[(Local File System\n/uploads)]
+  
+  oauth_ext{Social Login\nG / N / K}
+  hf_api[HuggingFace / LLM API]
+
+  %% 연결 관계
+  client -->|API Request| api
+  api --> auth
+  auth -.->|Auth Check| oauth_ext
+  
+  api -->|Metadata| db
+  api -->|Binary Files| fs
+
+  %% AI 연동 흐름
+  api --> ocr
+  api --> whisper
+  api --> llm
+  
+  %% LLM 외부 연동
+  llm <-->|Inference| hf_api
+
+  %% 스타일 지정
+  style FastAPI_Backend fill:#f5f5f5,stroke:#333,stroke-width:2px
+  style AI_Engine fill:#fff0f6,stroke:#c41d7f
+  style llm fill:#fff7e6,stroke:#d46b08
 ```
 
 ---
